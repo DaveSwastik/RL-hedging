@@ -1,0 +1,44 @@
+# src/configs/default.yaml
+# --- Experiment Configuration ---
+
+# Simulator Parameters
+simulator:
+  S0: 100.0
+  v0: 0.04
+  dt: 0.004  # 1/252, daily steps
+  steps: 50
+  rho: -0.7  # Correlation for Heston model
+  regimes:
+    - { name: "Low Vol",  theta: 0.04, kappa: 3.0, sigma_v: 0.2, mu: 0.05 }
+    - { name: "High Vol", theta: 0.16, kappa: 1.5, sigma_v: 0.4, mu: 0.05 }
+    - { name: "Crisis",   theta: 0.36, kappa: 1.0, sigma_v: 0.6, mu: -0.1 }
+  trans_mat: # P(row -> col)
+    - [0.98, 0.015, 0.005] # Low Vol ->
+    - [0.02, 0.97, 0.01]  # High Vol ->
+    - [0.05, 0.05, 0.90]  # Crisis ->
+
+# Option Specification
+option:
+  type: "Asian" # 'Asian', 'Lookback', 'Barrier'
+  K: 100.0
+  maturity: 0.1984 # T = steps * dt = 50 * 0.004
+  option_type: "call" # 'call' or 'put'
+
+# Environment Configuration
+environment:
+  trading_cost: 0.001 # Proportional cost (e.g., 10 bps)
+  reward_fn: "squared_error" # 'squared_error' or 'pnl'
+
+# Training Parameters
+training:
+  agent: "PPO"
+  policy: "MlpPolicy" # "MlpPolicy" or "MlpLstmPolicy"
+  n_envs: 16
+  batch_size: 64
+  n_epochs: 10
+  lr: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  timesteps: 100000 # Total timesteps for training
+  log_interval: 1

@@ -1,0 +1,33 @@
+# Byte-compiled/optimized files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+# Poetry creates venvs outside the project by default, but this is good practice
+.venv
+venv/
+env/
+*.egg-info/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project-specific generated files
+# --- IMPORTANT ---
+models/
+logs/
+*.zip
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Testing artifacts
+.pytest_cache/
+htmlcov/
