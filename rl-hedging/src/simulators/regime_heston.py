@@ -60,8 +60,10 @@ class RegimeHestonSimulator:
             idx = regimes[:, t]
             vt = np.maximum(v[:, t], 0)
             
-            v[:, t+1] = (vt + self.kappas[idx] * (self.thetas[idx] - vt) * self.dt +
-                         self.sigmas_v[idx] * np.sqrt(vt * self.dt) * Wv)
+            # v[:, t+1] = (vt + self.kappas[idx] * (self.thetas[idx] - vt) * self.dt +
+            #              self.sigmas_v[idx] * np.sqrt(vt * self.dt) * Wv)
+            v[:, t+1] = np.maximum((vt + self.kappas[idx] * (self.thetas[idx] - vt) * self.dt +self.sigmas_v [idx] * np.sqrt(vt * self.dt) * Wv),1e-8)  # Add a floor to prevent negative variance
+
             
             S[:, t+1] = S[:, t] * np.exp((self.mus[idx] - 0.5 * vt) * self.dt +
                                          np.sqrt(vt * self.dt) * Ws)
