@@ -21,6 +21,8 @@ plotly = "^5.17.0"
 pyyaml = "^6.0.1"
 shap = "^0.43.0"
 tqdm = "^4.66.1"
+seaborn = "^0.13.2"
+yfinance = "^0.2.66"
 
 [build-system]
 requires = ["poetry-core"]

@@ -31,8 +31,6 @@ class DeltaHedger:
             S_t = S_path[t_idx]
             sigma_t = np.sqrt(v_path[t_idx])
             
-            # For Asian options, a common approximation is to use BS on the underlying
-            # A more sophisticated model would use a Turnbull-Wakeman approximation
             target_delta = self._bs_delta(S_t, self.K, t_idx * dt, self.T, 0.0, sigma_t)
             
             trade_amount = target_delta - position
@@ -46,3 +44,22 @@ class DeltaHedger:
         cash -= abs(position) * final_price * self.trading_cost
         
         return cash # Final P&L
+
+    def get_positions(self, S_path, v_path, dt):
+        """
+        NEW HELPER FUNCTION
+        Returns the array of target delta positions over an episode.
+        """
+        n_steps = len(S_path) - 1
+        positions = []
+
+        for t_idx in range(n_steps):
+            t_rem = self.T - (t_idx * dt)
+            S_t = S_path[t_idx]
+            sigma_t = np.sqrt(v_path[t_idx])
+            
+            target_delta = self._bs_delta(S_t, self.K, t_idx * dt, self.T, 0.0, sigma_t)
+            positions.append(target_delta)
+        
+        positions.append(positions[-1]) # Hold final position at last step
+        return np.array(positions)
