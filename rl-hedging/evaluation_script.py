@@ -14,6 +14,7 @@ from src.envs.hedging_env import HedgingEnv
 from src.agents.models import InterpretableHedger # Your new model
 from src.baselines.delta_hedge import DeltaHedger
 from stable_baselines3 import PPO
+from src.utils.payoffs import PAYOFF_FUNCTIONS # Import the correct payoffs
 
 def load_config(path='src/configs/default.yaml'):
     with open(path, 'r') as f:
@@ -37,8 +38,15 @@ def evaluate_custom_agent(model_path, config_path, n_episodes=500):
         while not done:
             with torch.no_grad():
                 obs_sequence = torch.stack(obs_history).unsqueeze(0)
-                action_tensor, _ = model(obs_sequence)
-                action = action_tensor.detach().numpy().flatten()
+                # before
+                # action_tensor, _ = model(obs_sequence)
+                # action = action_tensor.detach().numpy().flatten()
+
+                # after
+                action_dist, _ = model(obs_sequence)
+                action = torch.tanh(action_dist.base.mean)
+                action = action.detach().numpy().flatten()
+             
             
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
@@ -111,8 +119,14 @@ def plot_single_episode_behavior(config_path, ppo_path, custom_path, seed, save_
     while not done:
         with torch.no_grad():
             obs_sequence = torch.stack(obs_history).unsqueeze(0)
-            action_tensor, _ = custom_model(obs_sequence)
-            action = action_tensor.detach().numpy().flatten()
+            # action_tensor, _ = custom_model(obs_sequence)
+            # action = action_tensor.detach().numpy().flatten()
+            action_dist, _ = custom_model(obs_sequence)
+            action = torch.tanh(action_dist.base.mean)
+            action = action.detach().numpy().flatten()
+
+
+
         
         obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -132,7 +146,7 @@ def plot_single_episode_behavior(config_path, ppo_path, custom_path, seed, save_
     # Subplot 2: Agent Positions
     ax2.plot(t_steps[:-1], dh_positions[:-1], label='Delta Hedger', linestyle='--', alpha=0.9)
     ax2.plot(t_steps[:-1], ppo_positions, label='PPO Agent', linestyle='-', alpha=0.8)
-    ax2.plot(t_steps[:-1], custom_positions, label='Custom (CVaR) Agent', linestyle='-', alpha=0.8)
+    ax2.plot(t_steps[:-1], custom_positions, label='Custom Agent (Sharpe)', linestyle='-', alpha=0.8) # <-- CHANGED
     ax2.set_xlabel('Time Step', fontsize=12)
     ax2.set_ylabel('Hedge Position (Units of Stock)', fontsize=12)
     ax2.legend(loc='upper left')
@@ -146,7 +160,7 @@ if __name__ == "__main__":
     # --- Configuration ---
     CONFIG_PATH = 'src/configs/default.yaml'
     PPO_MODEL_PATH = 'models/ppo_hedge' # Note: no .zip extension
-    CUSTOM_MODEL_PATH = 'models/custom_hedger.pth'
+    CUSTOM_MODEL_PATH = 'models/custom_sharpe_ac_hedger.pth' # <-- CHANGED
     RESULTS_DIR = Path('results')
     
     # Create results directory if it doesn't exist
@@ -171,7 +185,7 @@ if __name__ == "__main__":
     # --- Calculate and Display Final Summary ---
     ppo_stats = calculate_summary_stats(ppo_results, "PPO Agent")
     dh_stats = calculate_summary_stats(dh_results, "Delta Hedger")
-    custom_stats = calculate_summary_stats(custom_results, "Custom Agent (CVaR)")
+    custom_stats = calculate_summary_stats(custom_results, "Custom Agent (Sharpe)") # <-- CHANGED
 
     final_comparison = pd.DataFrame([ppo_stats, dh_stats, custom_stats])
 
@@ -182,13 +196,13 @@ if __name__ == "__main__":
     results_dict = {
         "Delta Hedger": dh_results,
         "PPO Agent": ppo_results,
-        "Custom Agent (CVaR)": custom_results
+        "Custom Agent (Sharpe)": custom_results # <-- CHANGED
     }
     
     # 1. Plot histogram of errors
     plot_error_histograms(results_dict, RESULTS_DIR / 'hedging_error_distribution.png')
     
-    # 2. Plot step-by-step behavior for one episode (e.g., seed 42)
+    # 2. Plot step-by-step behavior for one episode (e.g., seed 250)
     plot_single_episode_behavior(
         CONFIG_PATH,
         PPO_MODEL_PATH,

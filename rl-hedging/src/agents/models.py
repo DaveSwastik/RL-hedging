@@ -1,96 +1,99 @@
-# # src/agents/models.py    ##Mult-Layer Perceptron model
-# import torch
-# import torch.nn as nn
-
-# class CustomMLPPolicy(nn.Module):
-#     """
-#     A simple custom policy network.
-#     It takes an observation and outputs a continuous action.
-#     """
-#     def __init__(self, obs_dim: int, action_dim: int):
-#         super(CustomMLPPolicy, self).__init__()
-        
-#         # Define the network layers
-#         self.network = nn.Sequential(
-#             nn.Linear(obs_dim, 256),
-#             nn.Tanh(),
-#             nn.Linear(256, 256),
-#             nn.Tanh(),
-#             nn.Linear(256, action_dim) # Output layer
-#         )
-
-#     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-#         """
-#         Defines the forward pass of the model.
-#         """
-#         return self.network(obs)
-
-
-
-
-##GRU 
 # src/agents/models.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# --- Squashed Normal (tanh) ---
+class TanhNormal:
+    def __init__(self, mean, std):
+        self.base = torch.distributions.Normal(mean, std)
+
+    def sample(self):
+        z = self.base.rsample()
+        return torch.tanh(z)
+
+    def rsample(self):
+        z = self.base.rsample()
+        return torch.tanh(z)
+
+    def log_prob(self, a):
+        a = torch.clamp(a, -0.999999, 0.999999)
+        z = torch.atanh(a)
+        log_prob_z = self.base.log_prob(z)           # [..., action_dim]
+        corr = torch.log1p(-a.pow(2) + 1e-12)        # log(1 - a^2)
+        return (log_prob_z - corr).sum(dim=-1)       # reduce over action dim
+
+    def entropy(self):
+        # proxy: base entropy
+        return self.base.entropy().sum(dim=-1)
+
 class InterpretableHedger(nn.Module):
     """
-    A GRU-based recurrent policy with an Attention mechanism.
-    
-    This model addresses the "interpretability" research gap by exposing
-    attention weights, which show which past time steps the agent
-    focused on when making a decision.
+    Actor with GRU memory. Provides:
+      - step(obs_t, h): O(1) per step (fast mode)
     """
-    def __init__(self, obs_dim: int, hidden_dim: int = 128):
-        super(InterpretableHedger, self).__init__()
-        self.hidden_dim = hidden_dim
-        
-        # 1. GRU Layer to process sequence and create memory
+    def __init__(self, obs_dim: int, hidden_dim: int = 64):  # 64 is CPU-friendly
+        super().__init__()
         self.gru = nn.GRU(obs_dim, hidden_dim, batch_first=True)
-        
-        # 2. Attention Mechanism Layers
-        self.attention_net = nn.Linear(hidden_dim, 1)
-        
-        # 3. Final output layer
-        self.output_net = nn.Sequential(
+
+        self.action_mean = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1) # Outputs a single continuous action
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        self.action_log_std_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
         )
 
-    def forward(self, obs_sequence: torch.Tensor):
+    # FAST path: single time step with hidden state
+    def step(self, obs_t: torch.Tensor, h: torch.Tensor | None = None):
         """
-        Defines the forward pass of the model.
-        
-        Args:
-            obs_sequence (torch.Tensor): A tensor of shape 
-                                         (batch_size, sequence_length, obs_dim)
+        obs_t: [B, 1, obs_dim]
+        h:     [1, B, hidden_dim] or None
+        returns: (dist, h_next)
+        """
+        g, h_next = self.gru(obs_t, h)          # g: [B,1,H]
+        ctx = g[:, -1, :]                       # [B,H]
+        mu = self.action_mean(ctx)              # [B,1]
+        log_std = self.action_log_std_head(ctx).clamp(-5, 2)
+        std = torch.exp(log_std)
+        dist = TanhNormal(mu, std)
+        return dist, h_next
 
-        Returns:
-            torch.Tensor: The hedging action.
-            torch.Tensor: The attention weights for interpretability.
-        """
-        # Pass sequence through GRU
-        # gru_outputs shape: (batch_size, seq_len, hidden_dim)
-        gru_outputs, _ = self.gru(obs_sequence)
-        
-        # --- Attention Mechanism ---
-        # Compute attention scores for each time step
-        # energy shape: (batch_size, seq_len, 1)
-        energy = self.attention_net(gru_outputs)
-        
-        # Convert scores to probabilities (weights)
-        # attention_weights shape: (batch_size, seq_len, 1)
-        attention_weights = F.softmax(energy, dim=1)
-        
-        # Create context vector by taking a weighted average of GRU outputs
-        # context_vector shape: (batch_size, 1, hidden_dim)
-        context_vector = torch.bmm(attention_weights.transpose(1, 2), gru_outputs)
-        context_vector = context_vector.squeeze(1) # Shape: (batch_size, hidden_dim)
-        
-        # --- Final Action ---
-        # Pass the context vector through the output network
-        action = self.output_net(context_vector)
-        
-        return action, attention_weights.squeeze(-1)
+    # Full sequence path (for interpretability, but slower)
+    def forward(self, obs_sequence: torch.Tensor):
+        g, _ = self.gru(obs_sequence)           # [B,T,H]
+        ctx = g[:, -1, :]                       # last hidden
+        mu = self.action_mean(ctx)
+        log_std = self.action_log_std_head(ctx).clamp(-5, 2)
+        std = torch.exp(log_std)
+        dist = TanhNormal(mu, std)
+        # attention placeholder
+        B, T, _ = g.shape
+        attn = torch.full((B, T), 1.0 / T, device=g.device, dtype=g.dtype)
+        return dist, attn
+
+class Critic(nn.Module):
+    """
+    Value function sharing the GRU idea; exposes step() for O(1).
+    """
+    def __init__(self, obs_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.gru = nn.GRU(obs_dim, hidden_dim, batch_first=True)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def step(self, obs_t: torch.Tensor, h: torch.Tensor | None = None):
+        g, h_next = self.gru(obs_t, h)                # [B,1,H]
+        v = self.value_head(g[:, -1, :])              # [B,1]
+        return v.squeeze(-1), h_next                  # return scalar per batch
+
+    def forward(self, obs_sequence: torch.Tensor):
+        g, _ = self.gru(obs_sequence)
+        v = self.value_head(g[:, -1, :])
+        return v

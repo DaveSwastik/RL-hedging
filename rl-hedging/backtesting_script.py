@@ -272,6 +272,6 @@ if __name__ == "__main__":
         HIST_DATA_PATH,
         PPO_MODEL_PATH,
         CUSTOM_MODEL_PATH,
-        seed=250,  # Use the same seed for consistency
-        save_path=RESULTS_DIR / 'backtest_episode_behavior_seed250.png'
+        seed=120,  # Use the same seed for consistency
+        save_path=RESULTS_DIR / 'backtest_episode_behavior_seed120.png'
     )
