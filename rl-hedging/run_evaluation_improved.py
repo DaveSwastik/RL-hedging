@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 CUSTOM_MODEL_PATH = './runs/training_run_01/checkpoint_final.pth'
 PPO_MODEL_PATH = 'models/ppo_hedge_new.zip'
 N_EPISODES = 500
-PLOT_SEED = 180
+PLOT_SEED = 300
 CFG_FILE = os.path.join('src', 'configs', 'default.yaml')
 RESULTS_DIR = Path('results')
 
