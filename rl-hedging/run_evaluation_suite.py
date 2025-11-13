@@ -115,7 +115,7 @@ def evaluate_delta_hedger(config, n_episodes):
         results.append(info)
     return pd.DataFrame(results)
 
-def run_evaluation(config_path, ppo_path, custom_path, n_episodes=5000):
+def run_evaluation(config_path, ppo_path, custom_path, n_episodes=500):
     cfg = load_config(config_path)
     device = torch.device("cpu")
     
