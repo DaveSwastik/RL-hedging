@@ -1,0 +1,254 @@
+# src/agents/models.py
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# -------------------------
+# Utilities
+# -------------------------
+def orthogonal_init(m, gain=1.0):
+    if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+        nn.init.orthogonal_(m.weight, gain=gain)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+def linear_layer(in_dim, out_dim, bias=True):
+    ly = nn.Linear(in_dim, out_dim, bias=bias)
+    orthogonal_init(ly)
+    return ly
+
+# -------------------------
+# Tanh-squashed Normal distribution wrapper
+# -------------------------
+class TanhNormal:
+    """
+    A simple Squashed (tanh) Normal wrapper with sample(), rsample(), log_prob(), entropy()
+    Assumes mean/std shaped [..., action_dim]
+    """
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor):
+        self.base = torch.distributions.Normal(mean, std.clamp(min=1e-6))
+        self.mean = mean
+        self.std = std
+
+    def rsample(self):
+        z = self.base.rsample()
+        return torch.tanh(z)
+
+    def sample(self):
+        z = self.base.sample()
+        return torch.tanh(z)
+
+    def log_prob(self, action):
+        # action in (-1,1)
+        eps = 1e-6
+        a = action.clamp(-1 + eps, 1 - eps)
+        # atanh to invert tanh
+        z = 0.5 * torch.log((1 + a) / (1 - a))
+        log_prob_z = self.base.log_prob(z)
+        # correction term: log |d(tanh)/dz| = log(1 - tanh(z)^2) = log(1 - a^2)
+        correction = torch.log1p(-a.pow(2) + 1e-12)
+        # sum over action dim if multi-dim
+        return (log_prob_z - correction).sum(dim=-1)
+
+    def entropy(self):
+        # Use base distribution entropy as proxy (not exact after tanh)
+        return self.base.entropy().sum(dim=-1)
+
+# -------------------------
+# Custom GRU Cell
+# -------------------------
+class CustomGRUCell(nn.Module):
+    """
+    Implements a single GRU cell with optional layer norm for gates.
+    Equations:
+      z_t = sigmoid(W_z x_t + U_z h_{t-1} + b_z)
+      r_t = sigmoid(W_r x_t + U_r h_{t-1} + b_r)
+      n_t = tanh(W_n x_t + U_n (r_t * h_{t-1}) + b_n)
+      h_t = (1 - z_t) * n_t + z_t * h_{t-1}
+    """
+    def __init__(self, input_size, hidden_size, use_layernorm=False):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.use_layernorm = use_layernorm
+
+        # input linear transforms (combine for speed)
+        self.lin_x = linear_layer(input_size, hidden_size * 3)    # x -> (z, r, n)
+        self.lin_h = linear_layer(hidden_size, hidden_size * 2)   # h -> (z/r), plus separate for n
+        self.lin_h_n = linear_layer(hidden_size, hidden_size)     # h for candidate (after reset)
+
+        if use_layernorm:
+            self.ln_x = nn.LayerNorm(hidden_size * 3)
+            self.ln_h = nn.LayerNorm(hidden_size * 2)
+            self.ln_n = nn.LayerNorm(hidden_size)
+
+    def forward(self, x, h_prev):
+        # x: [B, input_size], h_prev: [B, hidden_size]
+        x_proj = self.lin_x(x)                 # [B, 3H]
+        h_proj = self.lin_h(h_prev)            # [B, 2H]
+        # split
+        x_z, x_r, x_n = x_proj.chunk(3, dim=-1)
+        h_zr, h_n_part = h_proj, self.lin_h_n(h_prev)  # h_n_part used after reset
+
+        if self.use_layernorm:
+            x_z, x_r, x_n = self.ln_x(torch.cat([x_z, x_r, x_n], dim=-1)).chunk(3, dim=-1)
+            h_zr = self.ln_h(h_zr)
+
+        h_z, h_r = h_zr.chunk(2, dim=-1)
+
+        z = torch.sigmoid(x_z + h_z)
+        r = torch.sigmoid(x_r + h_r)
+        # candidate
+        n = torch.tanh(x_n + r * h_n_part)
+        h_next = (1 - z) * n + z * h_prev
+
+        # expose gates optionally for interpretability
+        return h_next, z, r, n
+
+# -------------------------
+# Sequence GRU wrapper (batch_first=True)
+# -------------------------
+class CustomGRU(nn.Module):
+    """
+    Processes an input sequence through CustomGRUCell.
+    Exposes both forward(seq) and step(single) APIs.
+    """
+    def __init__(self, input_size, hidden_size, use_layernorm=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.cell = CustomGRUCell(input_size, hidden_size, use_layernorm=use_layernorm)
+
+    def forward(self, x, h0=None):
+        # x: [B, T, input_size]
+        B, T, _ = x.shape
+        device = x.device
+        if h0 is None:
+            h = torch.zeros(B, self.hidden_size, device=device, dtype=x.dtype)
+        else:
+            h = h0.squeeze(0) if (h0.dim() == 3 and h0.size(0) == 1) else h0
+
+        outputs = []
+        # optionally collect gate traces if needed (for debugging/interpretability)
+        for t in range(T):
+            xt = x[:, t, :]
+            h, z, r, n = self.cell(xt, h)
+            outputs.append(h.unsqueeze(1))
+        out = torch.cat(outputs, dim=1)  # [B, T, H]
+        # return outputs and last hidden in shape [1,B,H] to mimic nn.GRU semantics
+        return out, h.unsqueeze(0)
+
+    def step(self, x_t, h_prev):
+        # x_t: [B, 1, input_size] or [B, input_size]
+        squeezed = False
+        if x_t.dim() == 3 and x_t.size(1) == 1:
+            x = x_t.squeeze(1)
+            squeezed = True
+        else:
+            x = x_t
+        # h_prev expected shape [1,B,H] or [B,H]
+        if h_prev is None:
+            hprev = torch.zeros(x.shape[0], self.hidden_size, device=x.device, dtype=x.dtype)
+        else:
+            hprev = h_prev.squeeze(0) if (h_prev.dim() == 3 and h_prev.size(0) == 1) else h_prev
+        h_new, z, r, n = self.cell(x, hprev)
+        return h_new.unsqueeze(0), (z, r, n)  # follow (h_next, gates) - h_next shape [1,B,H]
+
+# -------------------------
+# Actor: GRU + Attention + TanhNormal policy
+# -------------------------
+class InterpretableHedger(nn.Module):
+    """
+    Actor using custom GRU + attention. Supports:
+      - forward(obs_seq) -> (dist, attn) where dist is TanhNormal
+      - step(obs_t, h) -> (dist, h_next) for O(1) per-step inference/training
+    """
+    def __init__(self, obs_dim: int, hidden_dim: int = 128, use_layernorm: bool = False):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.hidden_dim = hidden_dim
+
+        self.gru = CustomGRU(obs_dim, hidden_dim, use_layernorm=use_layernorm)
+
+        # attention scoring: project hidden vectors to scalar score
+        self.attn_score = linear_layer(hidden_dim, 1)
+        # action heads
+        self.action_mean = nn.Sequential(
+            linear_layer(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            linear_layer(hidden_dim // 2, 1)
+        )
+        # small log_std head (per-sample scalar)
+        self.action_log_std = nn.Parameter(torch.zeros(1, 1))  # learnable scalar log-std
+
+    def _make_dist(self, mu):
+        # mu: [B,1] or [B, action_dim]
+        std = torch.exp(self.action_log_std) + 1e-6
+        std = std.expand_as(mu)
+        return TanhNormal(mu, std)
+
+    def forward(self, obs_sequence: torch.Tensor):
+        """
+        obs_sequence: [B, T, obs_dim]
+        returns: dist (TanhNormal) based on last context and attention weights [B,T]
+        """
+        gru_out, h_last = self.gru(obs_sequence)   # gru_out: [B, T, H]
+        # Attention scores over T
+        scores = self.attn_score(gru_out).squeeze(-1)  # [B, T]
+        attn_weights = F.softmax(scores, dim=1)       # [B, T]
+        # context vector = weighted sum of gru_out
+        ctx = torch.einsum('bt,bth->bh', attn_weights, gru_out)  # [B,H]
+        mu = self.action_mean(ctx)  # [B,1]
+        dist = self._make_dist(mu)
+        return dist, attn_weights
+
+    def step(self, obs_t: torch.Tensor, h_prev=None):
+        """
+        Fast path for a single time step:
+          obs_t: [B, 1, obs_dim] or [B, obs_dim]
+          h_prev: [1, B, H] or None
+        returns: (dist, h_next)
+        """
+        # pass through GRU step
+        h_next, gates = self.gru.step(obs_t, h_prev)
+        # h_next: [1,B,H] => squeeze for head
+        ctx = h_next.squeeze(0)  # [B,H]
+        mu = self.action_mean(ctx)  # [B,1]
+        dist = self._make_dist(mu)
+        return dist, h_next
+
+# -------------------------
+# Critic (Value) sharing similar architecture
+# -------------------------
+class Critic(nn.Module):
+    """
+    Value function using custom GRU. Exposes step(obs_t, h) returning (v, h_next)
+    and forward(obs_seq) returning v for last step.
+    """
+    def __init__(self, obs_dim: int, hidden_dim: int = 128, use_layernorm: bool = False):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.gru = CustomGRU(obs_dim, hidden_dim, use_layernorm=use_layernorm)
+        self.value_head = nn.Sequential(
+            linear_layer(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            linear_layer(hidden_dim // 2, 1)
+        )
+
+    def forward(self, obs_sequence: torch.Tensor):
+        # obs_sequence: [B,T,obs_dim]
+        gru_out, h_last = self.gru(obs_sequence)
+        ctx = h_last.squeeze(0)  # [B,H]
+        v = self.value_head(ctx).squeeze(-1)  # [B]
+        return v
+
+    def step(self, obs_t: torch.Tensor, h_prev=None):
+        # obs_t: [B,1,obs_dim] or [B,obs_dim]
+        h_next, gates = self.gru.step(obs_t, h_prev)
+        ctx = h_next.squeeze(0)  # [B,H]
+        v = self.value_head(ctx).squeeze(-1)  # [B]
+        return v, h_next
+
+# Optional: QuantileCritic would go here (if you want distributional critic)
+# You can create a similar class that predicts `n_quantiles` values per state,
+# and train it with pinball (quantile) loss. I omitted for space but can add on request.

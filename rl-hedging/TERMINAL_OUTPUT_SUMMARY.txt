@@ -1,0 +1,160 @@
+# ✨ Clean Terminal Output - What Changed
+
+## 🎯 Summary
+
+Your training output is now **clean and informative**:
+
+```
+Training:  45%|███████████▌                | 2250/5000 [03:22<04:08] Actor Loss: 0.8234 | Value Loss: 0.2156 | GPD Loss: 0.3892 | Tail Events: 47,832
+```
+
+Instead of:
+```
+Update 10 stats: {...}
+Update 20 stats: {...}
+=== GPD Loss Debug (Update) ===
+    detached_returns: min=-0.001234, max=0.005678, ...
+    [WARNING] u_flat=-0.000123 outside...
+    tail_count: 45 / 800 (5.63%)
+    ...
+```
+
+---
+
+## 📦 What's New
+
+| Component | Change |
+|-----------|--------|
+| **Progress Bar** | Added `tqdm` progress bar showing % completion |
+| **Metrics Display** | Shows Actor/Value/GPD losses + Tail events count at every 10% |
+| **Debug Output** | Silenced by default (use `trainer.verbose = True` to enable) |
+| **Final Summary** | Nice box with total updates, elapsed time, file locations |
+
+---
+
+## 🚀 How to Run
+
+**Same as before:**
+```bash
+poetry run python run_training.py
+```
+
+**That's it!** The output is automatically clean.
+
+---
+
+## 🔍 Displayed Metrics (Every 10%)
+
+At **500 update intervals** (for 5000 total):
+
+| Metric | Computed From | What It Means |
+|--------|---------------|--------------|
+| Actor Loss | Policy gradient loss | How well policy improves (should ↓) |
+| Value Loss | MSE(predicted, actual) | How well value estimates (should ↓) |
+| GPD Loss | Tail risk modeling | How well tail distribution learned (should > 0) |
+| Tail Events | Count of samples < u | How many tail risk events seen so far |
+
+---
+
+## 📊 Example Output
+
+**At start (0%):**
+```
+Training:   0%|                             | 0/5000 [00:00<?, ?it/s]
+```
+
+**At 10% (500 updates):**
+```
+Training:  10%|██▌                          | 500/5000 [00:45<06:45] Actor Loss: 2.1234 | Value Loss: 0.5678 | GPD Loss: 0.0234 | Tail Events: 12,345
+```
+
+**At 50% (2500 updates):**
+```
+Training:  50%|███████████▌                 | 2500/5000 [03:45<03:45] Actor Loss: 0.9876 | Value Loss: 0.2456 | GPD Loss: 0.4123 | Tail Events: 62,543
+```
+
+**At 100% (5000 updates):**
+```
+Training: 100%|████████████████████████████| 5000/5000 [07:30<00:00] Actor Loss: 0.1245 | Value Loss: 0.0321 | GPD Loss: 0.5612 | Tail Events: 125,680
+
+================================================================================
+TRAINING COMPLETE ✓
+================================================================================
+Total updates: 5000
+Time elapsed: 2.08 hours
+Model saved: ./runs/training_run_01/checkpoint_final.pth
+Log saved: ./runs/training_run_01/training_log.csv
+================================================================================
+```
+
+---
+
+## 🎮 If You Need Verbose Debug Output
+
+Edit `run_training.py` and add one line:
+
+```python
+trainer = A2CTrainer(...)
+trainer.verbose = True  # ← Add this line
+
+train_loop(trainer, ...)
+```
+
+Now you'll see all the detailed debug output again.
+
+---
+
+## 📝 Code Changes Made
+
+1. **Added import**: `from tqdm import tqdm`
+2. **Added `verbose` flag** to `A2CTrainer.__init__()`
+3. **Wrapped training loop** with `tqdm(total=total_updates)`
+4. **Accumulate metrics** every 10% of training
+5. **Display postfix** with metrics every 10%
+6. **Silenced debug prints** (only show if `trainer.verbose = True`)
+7. **Added nice summary box** at end with training stats
+
+---
+
+## ✅ Clean Output Features
+
+✅ **Progress bar** — Visual % completion  
+✅ **ETA** — Time remaining (automatically calculated)  
+✅ **Speed** — Updates per second  
+✅ **Key metrics** — Actor/Value/GPD losses at 10% intervals  
+✅ **Tail event count** — Track anomaly detection progress  
+✅ **Final summary** — Total time, model path, log path  
+✅ **Optional verbose** — Enable debug if needed  
+
+---
+
+## 🔧 Customization
+
+**Show metrics every 20% instead of 10%:**
+```python
+# In trainer_a2c.py, line ~486, change:
+if progress_pct == 1.0 or (update + 1) % max(1, total_updates // 5) == 0:
+```
+
+**Show more metrics:**
+```python
+# Add to the metrics_str in train_loop:
+metrics_str = (
+    f"Actor Loss: {avg_actor_loss:.4f} | "
+    f"Value Loss: {avg_value_loss:.4f} | "
+    f"GPD Loss: {avg_gpd_loss:.4f} | "
+    f"Entropy: {entropy_sum / update_count:.4f} | "  # ← Add new metric
+    f"Tail Events: {tail_events_count:,}"
+)
+```
+
+---
+
+## 🎉 Done!
+
+Just run training normally:
+```bash
+poetry run python run_training.py
+```
+
+Enjoy the clean output! 🚀

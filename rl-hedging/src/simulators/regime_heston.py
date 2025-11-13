@@ -10,6 +10,7 @@ class RegimeHestonSimulator:
           - regimes: list of regime dicts: {'theta','kappa','sigma_v','mu'}
           - trans_mat: n_reg x n_reg transition matrix
           - rho: correlation between price and variance Brownian increments
+          - Optional (debug): shock_prob, shock_scale
         """
         self.params = params
         self.rng = np.random.default_rng(seed)
@@ -49,7 +50,7 @@ class RegimeHestonSimulator:
             Z1 = self.rng.standard_normal((n_paths,))
             Z2 = self.rng.standard_normal((n_paths,))
             Wv = Z2
-            Ws = self.rho * Z1 + np.sqrt(1 - self.rho**2) * Z2
+            Ws = self.rho * Z1 + np.sqrt(max(0.0, 1 - self.rho**2)) * Z2
 
             # Regime transitions
             rand_uni = self.rng.uniform(size=(n_paths, 1))
@@ -58,14 +59,41 @@ class RegimeHestonSimulator:
 
             # Step variance and spot (Euler discretization with full truncation)
             idx = regimes[:, t]
-            vt = np.maximum(v[:, t], 0)
-            
-            # v[:, t+1] = (vt + self.kappas[idx] * (self.thetas[idx] - vt) * self.dt +
-            #              self.sigmas_v[idx] * np.sqrt(vt * self.dt) * Wv)
-            v[:, t+1] = np.maximum((vt + self.kappas[idx] * (self.thetas[idx] - vt) * self.dt +self.sigmas_v [idx] * np.sqrt(vt * self.dt) * Wv),1e-8)  # Add a floor to prevent negative variance
+            vt = np.maximum(v[:, t], 0.0)
 
+            # variance step (full truncation, with small floor)
+            v_next = vt + self.kappas[idx] * (self.thetas[idx] - vt) * self.dt + self.sigmas_v[idx] * np.sqrt(np.maximum(vt * self.dt, 0.0)) * Wv
+            v[:, t+1] = np.maximum(v_next, 1e-8)
+
+            # spot step
+            S[:, t+1] = S[:, t] * np.exp((self.mus[idx] - 0.5 * vt) * self.dt + np.sqrt(np.maximum(vt * self.dt, 0.0)) * Ws)
+
+        # ---------------------
+        # Optional: synthetic shock injection (debugging only)
+        # ---------------------
+        
+        # --- *** THIS IS THE FIX *** ---
+        # Cast params to float to handle strings from YAML and avoid TypeErrors
+        try:
+            shock_prob = float(self.params.get('shock_prob', 0.0))
+        except (ValueError, TypeError):
+            shock_prob = 0.0
             
-            S[:, t+1] = S[:, t] * np.exp((self.mus[idx] - 0.5 * vt) * self.dt +
-                                         np.sqrt(vt * self.dt) * Ws)
+        try:
+            shock_scale = float(self.params.get('shock_scale', 0.0))
+        except (ValueError, TypeError):
+            shock_scale = 0.0
+        # --- *** END FIX *** ---
+
+        # Now the check is safe
+        if (shock_prob > 0.0) and (shock_scale > 0.0):
+            # Use RNG from this simulator
+            for i in range(n_paths):
+                if self.rng.random() < shock_prob:
+                    # choose a shock time between 1 and steps (inclusive)
+                    t_shock = int(self.rng.integers(1, self.steps + 1))
+                    # apply a downward multiplicative shock from t_shock onward
+                    S[i, t_shock:] *= np.exp(-float(shock_scale))
 
         return S, v, regimes
+# -------------------------

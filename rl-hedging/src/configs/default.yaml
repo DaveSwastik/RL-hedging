@@ -1,44 +1,102 @@
 # src/configs/default.yaml
-# --- Experiment Configuration ---
+# Single unified experiment config (simulator + env + model + training + eval)
 
+# -----------------------
 # Simulator Parameters
+# -----------------------
 simulator:
   S0: 100.0
   v0: 0.04
-  dt: 0.004  # 1/252, daily steps
-  steps: 50
-  rho: -0.7  # Correlation for Heston model
+  dt: 0.004       # time step in years
+  steps: 20       # number of timesteps per episode (smoke test)
+  rho: -0.7
+  r: 0.01         # risk-free rate used by BS proxy
+  reward_scale: 1e4   # scale for per-step squared reward (tune)
   regimes:
     - { name: "Low Vol",  theta: 0.04, kappa: 3.0, sigma_v: 0.2, mu: 0.05 }
     - { name: "High Vol", theta: 0.16, kappa: 1.5, sigma_v: 0.4, mu: 0.05 }
     - { name: "Crisis",   theta: 0.36, kappa: 1.0, sigma_v: 0.6, mu: -0.1 }
-  trans_mat: # P(row -> col)
-    - [0.98, 0.015, 0.005] # Low Vol ->
-    - [0.02, 0.97, 0.01]  # High Vol ->
-    - [0.05, 0.05, 0.90]  # Crisis ->
+  trans_mat:
+    - [0.98, 0.015, 0.005]
+    - [0.02, 0.97, 0.01]
+    - [0.05, 0.05, 0.90]
 
+# -----------------------
 # Option Specification
+# -----------------------
 option:
-  type: "Asian" # 'Asian', 'Lookback', 'Barrier'
+  type: "Asian"          # 'Asian', 'Lookback', 'Barrier' (select payoff in PAYOFF_FUNCTIONS)
   K: 100.0
-  maturity: 0.1984 # T = steps * dt = 50 * 0.004
-  option_type: "call" # 'call' or 'put'
+  maturity: 0.08         # years (should equal dt * steps)
+  option_type: "call"    # 'call' or 'put'
+  notional: 1.0
 
+# -----------------------
 # Environment Configuration
+# -----------------------
 environment:
-  trading_cost: 0.001 # Proportional cost (e.g., 10 bps)
-  reward_fn: "squared_error" # 'squared_error' or 'pnl'
+  trading_cost: 0.001    # proportional trading cost per trade (e.g., 10 bps)
+  reward_fn: "squared_error"  # 'squared_error' or 'pnl'
+  trade_penalty: 0.01    # additional penalty on trading volume if desired
+  obs_normalize: true    # use running mean/std normalization
+  include_delta_feature: false  # whether to expose BS delta as an observation
 
-# Training Parameters
-training:
-  agent: "PPO"
-  policy: "MlpPolicy" # "MlpPolicy" or "MlpLstmPolicy"
+# -----------------------
+# Model / Agent Settings
+# -----------------------
+model:
+  agent_type: "A2C"      # "A2C" or "PPO"
+  obs_dim: 6
+  hidden_dim: 128
+  use_layernorm: false
+  state_dependent_std: false
+
+# -----------------------
+# A2C/CVaR specific hyperparameters
+# -----------------------
+a2c:
   n_envs: 16
+  rollout_length: 50
+  lr_actor: 1e-5
+  lr_critic: 1e-4
+  gamma: 0.995
+  gae_lambda: 0.95
+  entropy_coef: 0.01
+  value_coef: 0.5
+  cvar_lambda: 1.0         # penalty multiplier for CVaR
+  quantile_weight: 1.0
+  n_quantiles: 32
+  max_grad_norm: 0.5
+  advantage_clip: 10.0
+  clip_adv_by_std: false
+  total_updates: 2000
+
+# -----------------------
+# PPO fallback (if you run PPO)
+# -----------------------
+ppo:
+  n_envs: 16
+  rollout_length: 2048
   batch_size: 64
   n_epochs: 10
-  lr: 0.0003
+  lr: 3e-4
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-  timesteps: 100000 # Total timesteps for training
-  log_interval: 1
+  entropy_coef: 0.0
+  value_coef: 0.5
+  total_timesteps: 100000
+
+# -----------------------
+# Evaluation & Logging
+# -----------------------
+evaluation:
+  eval_interval: 50
+  eval_episodes: 50
+  ins_window_days: 252
+  oos_window_days: 63
+
+logging:
+  logdir: ./runs/experiment_default
+  save_interval: 50
+  seed: 42

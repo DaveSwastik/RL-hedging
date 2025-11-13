@@ -1,0 +1,209 @@
+"""
+TRAINING PIPELINE DIAGRAM & CHECKPOINT STRUCTURE
+"""
+
+# ============================================================
+#  TRAINING PIPELINE
+# ============================================================
+
+                  ┌─────────────────────────────┐
+                  │  poetry run python          │
+                  │  run_training.py            │
+                  └──────────────┬──────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+                    ↓                         ↓
+            ┌───────────────┐      ┌──────────────────┐
+            │ Load Config   │      │ Create Models    │
+            └───────────────┘      │ - Actor          │
+                                   │ - Critic         │
+                    ┌──────────────→│ - QuantileCritic │
+                    │              └──────────────────┘
+                    │
+        ┌───────────┴────────────┐
+        │                        │
+        ↓                        ↓
+    Training Loop          Save Checkpoints
+    (5000 updates)         (every 100 updates)
+        │                        │
+        │   For each update:     │
+        │   1. collect_rollouts()│      ┌─────────────────────┐
+        │   2. trainer.update()  │─────→│ Every 100 updates:  │
+        │   3. Log metrics      │      │ torch.save({        │
+        │                        │      │   'actor': ...,     │
+        │                        │      │   'critic': ...,    │
+        │                        │      │   'quantile_critic' │
+        │                        │      │ }, f_path)          │
+        │                        │      │                     │
+        │                        │      │ Create:             │
+        │                        │      │ - checkpoint_*.pth  │
+        │                        │      │ - training_log.csv  │
+        │                        │      └─────────────────────┘
+        │                        │             │
+        └────────────────────────┴─────────────┤
+                                               │
+                          ┌────────────────────┴──────────────────┐
+                          │                                       │
+                          ↓                                       ↓
+                  ┌───────────────────┐              ┌────────────────────┐
+                  │ FINAL CHECKPOINT  │              │ TRAINING LOG       │
+                  │ checkpoint_5000   │              │ training_log.csv   │
+                  │ .pth              │              │ (metrics)          │
+                  │                   │              │ - actor_loss       │
+                  │ Contains:         │              │ - value_loss       │
+                  │ - actor weights   │              │ - gpd_loss         │
+                  │ - critic weights  │              │ - tail_percent     │
+                  │ - quantile_critic │              │ - entropy          │
+                  │   weights (NEW!)  │              │ - ... more         │
+                  └────────┬──────────┘              └────────────────────┘
+                           │
+                           │
+        ┌──────────────────┴──────────────────┐
+        │                                     │
+        ↓                                     ↓
+    python load_and_eval.py            Manual Inference
+    (automatic evaluation)              (in your code)
+        │                                     │
+        │  1. Load checkpoint                 │  actor, critic, ... =
+        │  2. Create eval env                 │    load_checkpoint(...)
+        │  3. Run 10 episodes                 │
+        │  4. Collect statistics              │  with torch.no_grad():
+        │  5. Print results                   │    pred = actor(obs)
+        │                                     │
+        ↓                                     ↓
+    ┌─────────────────────────────────────────────────────────┐
+    │ EVALUATION RESULTS                  │  PRODUCTION USE    │
+    │ - avg_pnl: 0.0245                  │ Live hedging with  │
+    │ - std_pnl: 0.0089                  │ trained actor      │
+    │ - avg_return: 0.0092               │                    │
+    │ - avg_hedge_error: 0.001234        │                    │
+    └─────────────────────────────────────────────────────────┘
+
+
+# ============================================================
+#  CHECKPOINT FILE CONTENTS
+# ============================================================
+
+checkpoint_5000.pth
+│
+├─ 'actor'
+│  ├─ 'net.0.weight': shape [64, 6]
+│  ├─ 'net.0.bias': shape [64]
+│  ├─ 'net.2.weight': shape [1, 64]
+│  ├─ 'net.2.bias': shape [1]
+│  └─ ... (all actor parameters)
+│
+├─ 'critic'
+│  ├─ 'net.0.weight': shape [64, 6]
+│  ├─ 'net.0.bias': shape [64]
+│  ├─ 'net.2.weight': shape [1, 64]
+│  ├─ 'net.2.bias': shape [1]
+│  └─ ... (all critic parameters)
+│
+└─ 'quantile_critic'  ← NEW! (was missing before)
+   ├─ 'net.0.weight': shape [32, 6]
+   ├─ 'net.0.bias': shape [32]
+   ├─ 'net.1.weight': shape [34, 32]
+   ├─ 'net.1.bias': shape [34]
+   └─ ... (all quantile_critic parameters)
+
+
+# ============================================================
+#  TIMELINE: WHAT GETS SAVED WHEN
+# ============================================================
+
+Update   0: Save checkpoint_0.pth
+Update 100: Save checkpoint_100.pth  ←│
+Update 200: Save checkpoint_200.pth   │
+Update 300: Save checkpoint_300.pth   │ Save every 100 updates
+Update 400: Save checkpoint_400.pth   │
+...                                   │
+Update 5000: Save checkpoint_5000.pth ←│ FINAL MODEL (recommended)
+
+Throughout: Write training_log.csv with metrics
+
+
+# ============================================================
+#  DIRECTORY TREE
+# ============================================================
+
+./runs/training_run_01/
+├── checkpoint_0.pth              (18.5 MB)
+├── checkpoint_100.pth            (18.5 MB)
+├── checkpoint_200.pth            (18.5 MB)
+├── ...
+├── checkpoint_5000.pth           (18.5 MB) ← USE THIS
+├── training_log.csv              (500 KB)
+└── [total disk space: ~1.8 GB for all checkpoints]
+
+
+# ============================================================
+#  LOADING & USING
+# ============================================================
+
+# Method 1: Using helper function (RECOMMENDED)
+from load_and_eval import load_checkpoint
+
+actor, critic, quantile_critic = load_checkpoint(
+    './runs/training_run_01/checkpoint_5000.pth'
+)
+
+
+# Method 2: Manual loading
+import torch
+from src.agents.models import MlpActor, MlpCritic
+from src.agents.cvar_ctitic import ExDrlCritic
+
+actor = MlpActor(obs_dim=6, hidden_dim=128, action_dim=1)
+critic = MlpCritic(obs_dim=6, hidden_dim=128)
+quantile_critic = ExDrlCritic(state_dim=6, hidden_dim=128)
+
+checkpoint = torch.load('./runs/training_run_01/checkpoint_5000.pth')
+actor.load_state_dict(checkpoint['actor'])
+critic.load_state_dict(checkpoint['critic'])
+quantile_critic.load_state_dict(checkpoint['quantile_critic'])
+
+actor.eval()
+critic.eval()
+quantile_critic.eval()
+
+# Now ready for inference!
+
+
+# ============================================================
+#  VERIFYING CHECKPOINT CONTENTS
+# ============================================================
+
+# Check what's in the checkpoint
+checkpoint = torch.load('./runs/training_run_01/checkpoint_5000.pth')
+print(checkpoint.keys())  
+# Output: dict_keys(['actor', 'critic', 'quantile_critic']) ✅
+
+# Check model sizes
+for model_name, state in checkpoint.items():
+    total_params = sum(p.numel() for p in state.values())
+    print(f"{model_name}: {total_params} parameters")
+
+# Output:
+# actor: 18945 parameters
+# critic: 18817 parameters
+# quantile_critic: 19345 parameters
+# Total: 57107 parameters
+
+
+# ============================================================
+#  TROUBLESHOOTING
+# ============================================================
+
+# Q: "quantile_critic not in checkpoint.keys()"
+# A: Checkpoint was created with old code. Retrain with updated code.
+
+# Q: "FileNotFoundError: checkpoint_5000.pth"
+# A: Training hasn't completed yet, or wrong path. Check ./runs/training_run_01/
+
+# Q: "ModuleNotFoundError when loading"
+# A: Make sure src/agents/models.py and cvar_ctitic.py are importable.
+
+# Q: "Shape mismatch when loading"
+# A: Model architecture changed. Checkpoint is incompatible. Retrain.
