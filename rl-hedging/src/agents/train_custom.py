@@ -52,13 +52,26 @@ def get_target_deltas(env: HedgingEnv, cfg: dict) -> np.ndarray:
     deltas = dh.get_positions(env.S_path, safe_v_path, cfg['simulator']['dt'])
     return deltas
 
-def train(config_path: str = 'src/configs/default.yaml', save_path: str = 'models/custom_hedger.pth'):
+def train(config_path: str = 'src/configs/default.yaml', save_path: str = 'models/custom_hedger.pth', theta: float = None, rho: float = None, kappa: float = None):
     """
     Trains the custom InterpretableHedger with a two-phase strategy:
     1. Pre-training: Mimic the classical Delta Hedger (inspired by Nian et al., 2021).
     2. Fine-tuning: Optimize a hybrid CVaR + MSE loss.
     """
     cfg = load_config(config_path)
+
+    # --- Parameter Overrides for Sweep ---
+    if rho is not None:
+        cfg['simulator']['rho'] = float(rho)
+        print(f"Overriding rho to {rho}")
+    
+    if theta is not None or kappa is not None:
+        for regime in cfg['simulator']['regimes']:
+            if theta is not None:
+                regime['theta'] = float(theta)
+            if kappa is not None:
+                regime['kappa'] = float(kappa)
+        print(f"Overriding regimes: theta={theta}, kappa={kappa}")
 
     # --- Setup ---
     # Use a slightly higher LR for potentially faster convergence with hybrid loss
