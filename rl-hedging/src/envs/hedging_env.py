@@ -60,6 +60,22 @@ class HedgingEnv(gym.Env):
         info = {}
         return obs, info
 
+    @property
+    def S_t(self):
+        return float(self.S_path[self.t_idx])
+
+    @S_t.setter
+    def S_t(self, value):
+        self.S_path[self.t_idx] = float(value)
+
+    @property
+    def V_t(self):
+        return float(self.v_path[self.t_idx])
+
+    @V_t.setter
+    def V_t(self, value):
+        self.v_path[self.t_idx] = float(max(value, 0.0))
+
     def step(self, action):
         # 1. Get positions and current state
         prev_pos = self.position
