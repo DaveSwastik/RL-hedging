@@ -58,12 +58,12 @@ def save_dashboard(history, save_path="training_mastery_report.png"):
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
-    # 3. Regime
-    ax3 = axes[2]
-    ax3.step(range(len(history['modes'])), history['modes'], color='orange', where='post')
-    ax3.set_yticks([0, 1, 2])
-    ax3.set_yticklabels(['Normal', 'Defensive', 'Panic'])
-    ax3.set_title('Regime Detection')
+    # # 3. Regime
+    # ax3 = axes[2]
+    # ax3.step(range(len(history['modes'])), history['modes'], color='orange', where='post')
+    # ax3.set_yticks([0, 1, 2])
+    # ax3.set_yticklabels(['Normal', 'Defensive', 'Panic'])
+    # ax3.set_title('Regime Detection')
     
     # 4. Tail Risk
     axes[3].plot(history['xis'], color='purple', label='Tail Index (Xi)')
@@ -79,7 +79,20 @@ def save_dashboard(history, save_path="training_mastery_report.png"):
 # 2. MAIN TRAINING LOOP
 # -------------------------------------------------------------------
 
-def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_rl_v2(5k-episodes).pth'):
+
+def empirical_cvar(values, alpha=0.05):
+    """Lower-tail CVaR for PnL (more negative = worse)."""
+    if len(values) == 0:
+        return 0.0
+    q = np.quantile(values, alpha)
+    tail = [v for v in values if v <= q]
+    return float(np.mean(tail)) if tail else float(q)
+
+def train_era_rl(
+    config_path='src/configs/default.yaml',
+    save_path='models/era_rl_v2(test5(5k)).pth',
+    # n_episodes_override: int | None = None,
+):
     cfg = load_config(config_path)
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cpu")  # Force CPU for debugging
@@ -98,14 +111,29 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
         {'params': agent.encoder.parameters(), 'lr': 3e-4},
         {'params': agent.actor.parameters(), 'lr': 1e-4}, 
         {'params': agent.critic.body_net.parameters(), 'lr': 3e-4},
+        {'params': agent.critic.quantile_layer.parameters(), 'lr': 3e-4},
+        {'params': agent.critic.attention_score.parameters(), 'lr': 3e-4},
         {'params': agent.critic.uncertainty_net.parameters(), 'lr': 3e-4}
+    ])
+
+    # Critic-only optimizer for optional pretraining (keeps actor frozen)
+    optimizer_critic = optim.Adam([
+        {'params': agent.encoder.parameters(), 'lr': 3e-4},
+        {'params': agent.critic.body_net.parameters(), 'lr': 3e-4},
+        {'params': agent.critic.quantile_layer.parameters(), 'lr': 3e-4},
+        {'params': agent.critic.attention_score.parameters(), 'lr': 3e-4},
+        {'params': agent.critic.uncertainty_net.parameters(), 'lr': 3e-4},
     ])
     # Slow Clock (Tail GPD)
     optimizer_tail = optim.Adam(agent.critic.tail_net.parameters(), lr=5e-5)
 
     # 3. Training Config
-    n_episodes = 5000
-    seq_len = 30 
+    n_episodes = 100          # full training (use smaller for smoke tests)
+    seq_len = 30
+
+    # # QUICK TEST: you can override to e.g. 200 for fast runs
+    # if n_episodes_override is not None:
+    #     n_episodes = int(n_episodes_override)
     
     # Phases
     p1 = 0.15
@@ -113,6 +141,16 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
 
     phase_1_end = int(p1 * n_episodes) 
     phase_2_end = int((p1 + p2) * n_episodes) 
+
+    # Tail / critic pretrain & imitation warm-start
+    EPISODES_PRETRAIN_CRITIC = 1000   # if >0, train critic/tail only for these episodes
+    EPISODES_IMITATE = 2000           # warm-start actor to follow BS; decay after
+    IMITATION_START_WEIGHT = 0.8     # WAS 0.4: Stronger initial guidance
+    IMITATION_END_WEIGHT = 0.0       # decays to this over EPISODES_IMITATE
+
+    # Relative CVaR objective hyperparams (tuned for better PnL balance)
+    LAMBDA_REL = 1.0
+    LAMBDA_CVAR = 0.01   # WAS 0.05: Reduced to stop the "Pessimism Gap"
     
     # Buffers
     tail_buffer = deque(maxlen=2000)
@@ -129,18 +167,20 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
         if episode < phase_1_end:
             phase = "FORCED_ENTRY"
             cost_multiplier = 0.0 
-            entropy_coef = 0.05
+            entropy_coef = 0.2
             shock_prob = 0.0
         elif episode < phase_2_end:
             phase = "STABILIZATION"
             cost_multiplier = 1.0 
-            entropy_coef = 0.01
+            entropy_coef = 0.05
             shock_prob = 0.05
         else:
             phase = "MASTERY"
             cost_multiplier = 1.0
-            entropy_coef = 0.005
-            shock_prob = 0.15 
+            # Linearly decay entropy to stop random guessing
+            progress = (episode - phase_2_end) / max(1, (n_episodes - phase_2_end))
+            entropy_coef = max(0.005, 0.05 * (1.0 - progress))
+            shock_prob = 0.15
 
         # --- ROLLOUT ---
         obs, _ = env.reset()
@@ -150,17 +190,30 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
         obs_history = deque([obs_tensor for _ in range(seq_len)], maxlen=seq_len)
         
+        # stable prev_hedge shapes (actor position)
         prev_hedge = torch.tensor([[0.0]], device=device)
+
+        # BS baseline bookkeeping (scalar floats)
+        bs_prev_hedge = 0.0
+        prev_V = env.V_t  # variance state (used to form sigma for BS delta)
         
         # Episode Storage
         ep_log_probs = []
         ep_entropies = []
         ep_quantiles = []
-        ep_rewards = []
+        # ep_rewards = []
         ep_values = []
         ep_latents = []  
         ep_grus = []     
         ep_us = []       
+        ep_actions = []
+        ep_price_rets = []
+        ep_mode_probs = []
+        ep_bs_deltas = []
+
+        # --- Patch: keep raw RL PnL and adjusted reward separate ---
+        ep_rl_raw_rewards = []   # raw pnl from environment (rl_pnl)
+        ep_rewards_adj = []      # adjusted reward (adv - lambda * cvar)
         
         done = False
         t = 0
@@ -188,20 +241,68 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
             dist = agent.actor(latent, risk_out)
             
             # Sample Action
-            action, mode_idx = dist.sample_with_mode()
-            action_val = action.item()
+            action_tanh, mode_idx = dist.sample_with_mode()  # tanh-space action in [-1, 1]
+            if phase != "MASTERY":   # allow more exploration in early phases
+                noise = float(np.random.normal(scale=0.15))   # was 0.08
+            else:
+                noise = float(np.random.normal(scale=0.1))   # was 0.02
+
+            # --- Patch 1 + 2: Scale to env range [-2,2] and add stronger exploration ---
+            action_val = float(np.clip(float(action_tanh.item()) * 1.2, -0.5, 1.2))
+            action_val = float(np.clip(action_val + noise, -0.5, 1.2))
+
+            # Keep a tanh-space proxy action for log_prob/prev_hedge encoding
+            action_for_logprob = torch.tensor([[action_val / 2.0]], dtype=torch.float32, device=device)
 
             # --- Optional: capture regime probabilities for analysis ---
             with torch.no_grad():
                 mode_probs = torch.softmax(dist.cat_dist.logits, dim=-1).cpu().numpy()[0]
+            ep_mode_probs.append(mode_probs)
             
-            # 4. Step Environment
+            # 4. Step Environment + BS baseline + CVaR objective
+            prev_price = env.S_t
+            prev_V = env.V_t  # variance before step
+
+            # BS delta computed at the same state/time as the RL decision
+            tau = max(env.T - env.t_idx, 0) * env.dt
+            sigma = float(np.sqrt(max(prev_V, 1e-8)))
+            _, bs_delta, _, _ = bs_greeks(prev_price, cfg['option']['K'], 0, 0, sigma, tau, 'call')
+            ep_bs_deltas.append(float(bs_delta))
+
             next_obs, raw_reward, terminated, truncated, info = env.step(np.array([action_val]))
+
+            # Store prev_price in info for downstream logging/analysis
+            info['prev_price'] = prev_price
+
+            # Discrete tick PnLs (unscaled): RL uses env's hedger PnL; BS uses same d_option + dS
+            rl_pnl = float(info.get('pnl_hedger', raw_reward))
+
+            dS = float(env.S_t - prev_price)
+            d_option = float(info.get('d_option', 0.0))
+            bs_trade = abs(bs_delta - bs_prev_hedge) * prev_price
+            bs_tx_cost = bs_trade * real_cost
+            bs_pnl = (-d_option) + (bs_prev_hedge * dS) - bs_tx_cost
+
+            # CVaR estimate from critic (parametric GPD head)
+            # risk_out already computed above (before stepping env)
+            cvar_val = agent.compute_risk_penalty(risk_out, alpha=0.05).item()
+
+            # Relative CVaR objective
+            advantage = rl_pnl - bs_pnl
+            turnover = abs(action_val - prev_hedge.item())
+            smoothness_penalty = 0.05 * turnover
+            adjusted_reward = (LAMBDA_REL * advantage) - (LAMBDA_CVAR * cvar_val) - smoothness_penalty
             
-            # Cost Annealing
-            actual_trade = abs(action_val - prev_hedge.item()) * env.S_t
-            implied_cost = actual_trade * real_cost
-            adjusted_reward = raw_reward + (implied_cost * (1.0 - cost_multiplier))
+
+            # Optional: keep annealing of explicit transaction refund if desired
+            # implied_cost = abs(action_val - prev_hedge.item()) * env.S_t * real_cost
+            # adjusted_reward += implied_cost * (1.0 - cost_multiplier)
+
+            # update BS bookkeeping for next tick
+            bs_prev_hedge = float(bs_delta)
+
+            # Price return retained for diagnostics
+            price_ret = (env.S_t - info.get('prev_price', env.S_t)) / (info.get('prev_price', env.S_t) + 1e-8)
             
             done = terminated or truncated
             
@@ -211,6 +312,8 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
                 "Step": t,
                 "Phase": phase,
                 "Price": env.S_t,
+                "PrevPrice": float(info.get('prev_price', env.S_t)),
+                "PriceRet": float(price_ret),
                 "Action": action_val,
                 "Reward": adjusted_reward,
                 "Cost_Mult": cost_multiplier,
@@ -223,47 +326,128 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
                 "Prob_Mode2": float(mode_probs[2]),
 
                 "Xi": risk_out['xi'].item(),
+                "Sigma": risk_out['sigma'].item(),
                 "Uncertainty": risk_out['uncertainty'].item(),
                 "Shock": is_shock,
 
                 "CVaR_5pct": cvar_val,          # added for benchmarking
 
+                # Baseline diagnostics
+                "RL_PnL": float(rl_pnl),
+                "BS_PnL": float(bs_pnl),
+                "Advantage": float(advantage),
+                "BS_Delta": float(bs_delta),
+
                 "EpisodeTotalPnl": np.nan,      # Placeholder
                 "EpisodeAvgPnlPerStep": np.nan, # Placeholder
-                "EpisodeLen": 0                 # Placeholder
+                "EpisodeLen": 0,                # Placeholder
+
+                # Empirical CVaR episode metrics (backfilled at end)
+                "Empirical_RL_CVaR": np.nan,
+                "Empirical_BS_CVaR": np.nan,
+                "Delta_CVaR_RL_minus_BS": np.nan,
+                "Critic_CVaR_Estimate": np.nan,
+
+                # Critic calibration / tail diagnostics (backfilled at end)
+                "Empirical_RL_Q5": np.nan,
+                "Critic_u": np.nan,
+                "TailFillFrac": np.nan,
+                "MeanXi": np.nan,
+                "MeanSigma": np.nan,
+
+                # Episode-level diagnostics (backfilled at end)
+                "ActionStd": np.nan,
+                "CorrActionRet": np.nan,
+                "ModeEntropy": np.nan,
             })
                 
             
             # 6. Store Tensors
-            ep_log_probs.append(dist.log_prob(action))
+            ep_log_probs.append(dist.log_prob(action_for_logprob))
             ep_entropies.append(dist.entropy())
             ep_quantiles.append(risk_out['quantiles'])
             ep_latents.append(latent.detach()) 
             ep_grus.append(gru_hist.detach())
-            ep_us.append(risk_out['u'].detach())
-            ep_rewards.append(adjusted_reward)
+            ep_us.append(float(risk_out['u'].item()))
+            ep_rl_raw_rewards.append(float(rl_pnl))
+            ep_rewards_adj.append(float(adjusted_reward))
             ep_values.append(risk_out['quantiles'][0, agent.critic.num_quantiles // 2])
+            ep_actions.append(action_val)
+            ep_price_rets.append(float(price_ret))
             
             # Update State
             obs_history.append(torch.tensor(next_obs, dtype=torch.float32, device=device))
             
             # --- PATCH 2: Stable prev_hedge shape ---
-            prev_hedge = action.detach().view(1, 1)
+            prev_hedge = torch.tensor([[action_val]], dtype=torch.float32, device=device)
             # ----------------------------------------
             
             t += 1
             
         # --- PATCH 4: Episode Summaries & Backfill ---
-        episode_total_pnl = float(info.get('terminal_pnl', np.sum(ep_rewards)))
-        episode_avg_pnl_per_step = float(np.mean(ep_rewards)) if len(ep_rewards) > 0 else 0.0
+        episode_total_pnl = float(info.get('terminal_pnl', np.sum(ep_rl_raw_rewards)))
+        episode_avg_pnl_per_step = float(np.mean(ep_rl_raw_rewards)) if len(ep_rl_raw_rewards) > 0 else 0.0
         episode_len = t
+
+        # --- Patch 5: Episode-end diagnostics ---
+        action_std = float(np.std(ep_actions)) if len(ep_actions) > 0 else 0.0
+        if len(ep_actions) > 1 and np.std(ep_price_rets) > 1e-12 and np.std(ep_actions) > 1e-12:
+            corr_action_ret = float(np.corrcoef(np.array(ep_actions), np.array(ep_price_rets))[0, 1])
+            if not np.isfinite(corr_action_ret):
+                corr_action_ret = 0.0
+        else:
+            corr_action_ret = 0.0
+
+        if len(ep_mode_probs) > 0:
+            avg_mode_probs = np.mean(np.stack(ep_mode_probs, axis=0), axis=0)
+            mode_entropy = float(-(avg_mode_probs * np.log(avg_mode_probs + 1e-8)).sum())
+        else:
+            mode_entropy = 0.0
+
+        # ----- Empirical CVaR calculation from this episode -----
+        ep_rows = training_log[-episode_len:] if episode_len > 0 else []
+        ep_rl_pnls = [row.get("RL_PnL", 0.0) for row in ep_rows]
+        ep_bs_pnls = [row.get("BS_PnL", 0.0) for row in ep_rows]
+
+        emp_rl_cvar = empirical_cvar(ep_rl_pnls, alpha=0.05)
+        emp_bs_cvar = empirical_cvar(ep_bs_pnls, alpha=0.05)
+        delta_cvar = emp_rl_cvar - emp_bs_cvar
+
+        critic_cvar_estimate = float(
+            np.mean([r.get("CVaR_5pct", 0.0) for r in ep_rows])
+        ) if episode_len > 0 else 0.0
+        # --------------------------------------------------------
+
+        # --- Critic calibration diagnostics ---
+        emp_rl_q5 = float(np.quantile(ep_rl_pnls, 0.05)) if len(ep_rl_pnls) > 0 else 0.0
+        critic_u = float(np.mean(ep_us)) if len(ep_us) > 0 else 0.0
+        mean_xi = float(np.mean([r.get('Xi', 0.0) for r in ep_rows])) if episode_len > 0 else 0.0
+        mean_sigma = float(np.mean([r.get('Sigma', 0.0) for r in ep_rows])) if episode_len > 0 else 0.0
 
         episode_summaries.append({
             'Episode': episode,
             'Phase': phase,
             'EpisodeTotalPnl': episode_total_pnl,
             'EpisodeAvgPnlPerStep': episode_avg_pnl_per_step,
-            'EpisodeLen': episode_len
+            'EpisodeLen': episode_len,
+
+            # --- NEW METRICS ---
+            'Empirical_RL_CVaR': emp_rl_cvar,
+            'Empirical_BS_CVaR': emp_bs_cvar,
+            'Delta_CVaR_RL_minus_BS': delta_cvar,
+            'Critic_CVaR_Estimate': critic_cvar_estimate,
+            # -------------------
+
+            # --- Calibration / tail diagnostics ---
+            'Empirical_RL_Q5': emp_rl_q5,
+            'Critic_u': critic_u,
+            'MeanXi': mean_xi,
+            'MeanSigma': mean_sigma,
+            # -------------------
+
+            'ActionStd': action_std,
+            'CorrActionRet': corr_action_ret,
+            'ModeEntropy': mode_entropy,
         })
 
         # Backfill current episode rows in training_log
@@ -272,55 +456,138 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
             training_log[row_idx]['EpisodeTotalPnl'] = episode_total_pnl
             training_log[row_idx]['EpisodeAvgPnlPerStep'] = episode_avg_pnl_per_step
             training_log[row_idx]['EpisodeLen'] = episode_len
+
+            training_log[row_idx]['Empirical_RL_CVaR'] = emp_rl_cvar
+            training_log[row_idx]['Empirical_BS_CVaR'] = emp_bs_cvar
+            training_log[row_idx]['Delta_CVaR_RL_minus_BS'] = delta_cvar
+            training_log[row_idx]['Critic_CVaR_Estimate'] = critic_cvar_estimate
+
+            training_log[row_idx]['Empirical_RL_Q5'] = emp_rl_q5
+            training_log[row_idx]['Critic_u'] = critic_u
+            training_log[row_idx]['MeanXi'] = mean_xi
+            training_log[row_idx]['MeanSigma'] = mean_sigma
+
+            training_log[row_idx]['ActionStd'] = action_std
+            training_log[row_idx]['CorrActionRet'] = corr_action_ret
+            training_log[row_idx]['ModeEntropy'] = mode_entropy
         # -----------------------------------------------------
 
         # --- UPDATE STEP ---
         
         # A. Calculate Returns
         gamma = 0.99
-        returns = []
-        R = 0
-        for r in reversed(ep_rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns, dtype=torch.float32, device=device).unsqueeze(1)
-        
-        # B. Tail Buffer Population
-        for i in range(len(returns)):
-            if returns[i] < ep_us[i]:
-                # --- PATCH 3: Normalize Tail Buffer Items ---
-                _latent = ep_latents[i].detach().squeeze(0)   # -> [H]
-                _gru = ep_grus[i].detach().squeeze(0)         # -> [T, H]
-                _ret = returns[i].detach().squeeze()          # -> scalar
-                tail_buffer.append((_latent, _gru, float(_ret)))
-                # --------------------------------------------
+
+        # returns_raw: used for critic targets and tail fitting
+        returns_raw = []
+        Rr = 0.0
+        for r in reversed(ep_rl_raw_rewards):
+            Rr = r + gamma * Rr
+            returns_raw.insert(0, Rr)
+        returns_raw = torch.tensor(returns_raw, dtype=torch.float32, device=device).unsqueeze(1)
+
+        # returns_adj: used for actor advantage (penalized objective)
+        returns_adj = []
+        Ra = 0.0
+        for r in reversed(ep_rewards_adj):
+            Ra = r + gamma * Ra
+            returns_adj.insert(0, Ra)
+        returns_adj = torch.tensor(returns_adj, dtype=torch.float32, device=device).unsqueeze(1)
+
+        # B. Tail Buffer Population (robust): add worst 20% (at least 3) returns_raw
+        tail_added = 0
+        if len(ep_rl_raw_rewards) > 0:
+            k = max(3, int(0.20 * len(ep_rl_raw_rewards)))
+            worst_idx = np.argsort(returns_raw.detach().cpu().numpy().squeeze())[:k]
+            for i in worst_idx:
+                
+                _latent = ep_latents[int(i)].detach().squeeze(0)  # [H]
+                _gru = ep_grus[int(i)].detach().squeeze(0)        # [T,H]
+                # KEY FIX: store positive loss magnitude for GPD fitting
+                _loss_mag = -float(returns_raw[int(i)].detach().squeeze().item())
+                tail_buffer.append((_latent, _gru, _loss_mag))
+                tail_added += 1
+
+        tail_fill_frac = float(tail_added / max(1, episode_len))
+
+        # backfill tail fill fraction into episode rows
+        for row_idx in range(max(0, start_idx), len(training_log)):
+            training_log[row_idx]['TailFillFrac'] = tail_fill_frac
                 
         # C. Main Gradient Update
-        optimizer_main.zero_grad()
-        
-        # Body Loss
-        quantiles_stack = torch.cat(ep_quantiles, dim=0)
-        body_loss = generalized_quantile_huber_loss(quantiles_stack, returns)
-        
-        # Actor Loss
-        values_stack = torch.stack(ep_values).squeeze()
-        adv = returns.squeeze() - values_stack.detach()
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        
-        log_probs_stack = torch.stack(ep_log_probs).squeeze()
-        entropy_stack = torch.stack(ep_entropies).squeeze()
-        
-        actor_loss = -(log_probs_stack * adv).mean()
-        ent_loss = -entropy_coef * entropy_stack.mean()
-        
-        loss = body_loss + actor_loss + ent_loss
-        loss.backward()
-        nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
-        optimizer_main.step()
+        if episode < EPISODES_PRETRAIN_CRITIC:
+            # --- Critic-only pretraining: fit quantiles (and encoder representation) ---
+            optimizer_critic.zero_grad()
+
+            quantiles_stack = torch.cat(ep_quantiles, dim=0)
+            # PnL-to-Loss mapping (EVT models right tail; finance risk is left tail)
+            # Quantiles learn the distribution of LOSSES where Loss = -PnL
+            target_loss = -returns_raw.detach()
+            body_loss = generalized_quantile_huber_loss(quantiles_stack, target_loss)
+
+            body_loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+            optimizer_critic.step()
+        else:
+            # Normal joint update (actor + critic body)
+            optimizer_main.zero_grad()
+
+            quantiles_stack = torch.cat(ep_quantiles, dim=0)
+            # Quantiles learn the distribution of LOSSES where Loss = -PnL
+            target_loss = -returns_raw.detach()
+            body_loss = generalized_quantile_huber_loss(quantiles_stack, target_loss)
+
+            values_stack = torch.stack(ep_values).squeeze()
+            # ep_values come from the critic quantiles; after the Loss mapping they are in loss-space.
+            # Convert to a PnL-like proxy so the advantage has the correct directionality.
+            values_pnl_proxy = -values_stack.detach()
+            adv = returns_adj.squeeze() - values_pnl_proxy
+
+            # ROBUST ADVANTAGE SCALING
+            if adv.std() > 1e-4:
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            else:
+                adv = adv - adv.mean()
+
+            log_probs_stack = torch.stack(ep_log_probs).squeeze()
+            entropy_stack = torch.stack(ep_entropies).squeeze()
+
+            # Actor (policy) loss (REINFORCE-style)
+            actor_loss = -(log_probs_stack * adv).mean()
+            ent_loss = -entropy_coef * entropy_stack.mean()
+
+
+
+            # === Imitation warm-start (MSE to BS delta) ===
+            imit_loss = torch.tensor(0.0, device=device)
+            imit_weight = 0.0
+            if episode < EPISODES_IMITATE and len(ep_actions) > 0 and len(ep_bs_deltas) == len(ep_actions):
+                actor_actions_tanh = torch.tensor(
+                    [a / 2.0 for a in ep_actions],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                bs_deltas_t = torch.tensor(
+                    ep_bs_deltas,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                imit_loss = nn.functional.mse_loss(actor_actions_tanh, bs_deltas_t)
+
+                frac = max(0.0, 1.0 - (episode / EPISODES_IMITATE))
+                imit_weight = IMITATION_END_WEIGHT + (IMITATION_START_WEIGHT - IMITATION_END_WEIGHT) * frac
+
+            mode_probs = torch.softmax(dist.cat_dist.logits, dim=-1)
+            # Encourage diversity (higher entropy) across mixture modes
+            diversity_bonus = 0.01 * (mode_probs * torch.log(mode_probs + 1e-8)).sum(dim=-1).mean()
+
+            loss = body_loss + actor_loss + ent_loss + (imit_weight * imit_loss) + diversity_bonus
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+            optimizer_main.step()
         
         # D. Tail Gradient Update (GPD)
-        # --- PATCH 5: Robust Tail Batching & Stable GPD Loss ---
-        if len(tail_buffer) > 64 and episode % 10 == 0:
+        # --- TAIL UPDATE PATCH ---
+        if len(tail_buffer) > 64 and episode % 1 == 0:  # Update every episode
             optimizer_tail.zero_grad()
             indices = np.random.choice(len(tail_buffer), 64, replace=False)
 
@@ -338,15 +605,18 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
             # Forward Tail Head
             raw_tail = agent.critic.tail_net(b_latents)
             sigma = torch.nn.functional.softplus(raw_tail[:, 0:1]) + 1e-6
+            # 1. Synchronize Xi scaling with models.py
             xi = torch.tanh(raw_tail[:, 1:2]) * 0.5
 
             # Recalculate u using critic (no grad)
             with torch.no_grad():
                 risk_current = agent.critic(b_latents, b_grus)
-                u_current = risk_current['u']  # [B,1]
+                # u is now trained in LOSS space (see target_loss above)
+                u_loss_threshold = risk_current['u']  # [B,1]
 
-            # Exceedances (positive by construction)
-            exceedances = (u_current - b_returns).clamp(min=1e-6)  # [B,1]
+            # 2. Correct Exceedance Calculation (for positive losses)
+            # exceedances = Loss_Magnitude - Loss_Threshold
+            exceedances = (b_returns - u_loss_threshold).clamp(min=1e-4)  # [B,1]
 
             # Stable GPD NLL
             eps = 1e-6
@@ -366,14 +636,17 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
                 torch.log(sigma_clamped) + z   # limiting exponential case for xi -> 0
             )
 
-            tail_loss = nll.mean()
+            # 3. Add L2 Reg to keep parameters from hitting boundaries
+            l2_reg = 1e-4 * sum(p.pow(2).sum() for p in agent.critic.tail_net.parameters())
+
+            tail_loss = nll.mean() + l2_reg
             tail_loss.backward()
             optimizer_tail.step()
         # -------------------------------------------------------
 
         # Update progress bar
         if episode % 10 == 0:
-            pbar.set_description(f"Ep {episode} | R: {np.sum(ep_rewards):.2f} | Phase: {phase}")
+            pbar.set_description(f"Ep {episode} | R: {np.sum(ep_rewards_adj):.2f} | Phase: {phase}")
 
     # --- SAVE ---
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -384,12 +657,35 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
     print("Exporting training logs...")
     # 1. Step-level log
     df_log = pd.DataFrame(training_log)
-    df_log.to_csv("training_log_v2(5k-episodes).csv", index=False)
+    df_log.to_csv("training_log_v2(test5(5k)).csv", index=False)
     
     # 2. Episode-level summary
     df_summary = pd.DataFrame(episode_summaries)
-    df_summary.to_csv("episode_summaries(5k-episodes).csv", index=False)
-    print("Logs saved: training_log_v2(5k-episodes).csv, episode_summaries(5k-episodes).csv")
+    df_summary.to_csv("episode_summaries(test5(5k)).csv", index=False)
+    print("Logs saved: training_log_v2(test5(5k)).csv, episode_summaries(test5(5k)).csv")
+
+    # --- Quick summaries / smoke-test diagnostics ---
+    try:
+        print("Summary (last 100 episodes):")
+        recent = df_log[df_log['Episode'] >= max(0, n_episodes - 100)]
+        n_eps_recent = max(1, int(recent['Episode'].nunique()))
+        print("Mean RL_PnL:", float(recent['RL_PnL'].sum() / n_eps_recent) if 'RL_PnL' in recent else float('nan'))
+        print("Mean BS_PnL:", float(recent['BS_PnL'].sum() / n_eps_recent) if 'BS_PnL' in recent else float('nan'))
+        print("Mean Advantage:", float(recent['Advantage'].sum() / n_eps_recent) if 'Advantage' in recent else float('nan'))
+        print("Mean CVaR:", float(recent['CVaR_5pct'].mean()) if 'CVaR_5pct' in recent else float('nan'))
+        print("Empirical RL CVaR:", float(recent['Empirical_RL_CVaR'].mean()))
+        print("Empirical BS CVaR:", float(recent['Empirical_BS_CVaR'].mean()))
+        print("Δ CVaR (RL - BS):", float(recent['Delta_CVaR_RL_minus_BS'].mean()))
+        print("Critic CVaR estimate:", float(recent['CVaR_5pct'].mean()))
+
+        if len(df_summary) > 0:
+            last = df_summary.tail(1)
+            print("Diagnostics (last episode):")
+            print("ActionStd:", float(last['ActionStd'].iloc[0]) if 'ActionStd' in last else float('nan'))
+            print("CorrActionRet:", float(last['CorrActionRet'].iloc[0]) if 'CorrActionRet' in last else float('nan'))
+            print("ModeEntropy:", float(last['ModeEntropy'].iloc[0]) if 'ModeEntropy' in last else float('nan'))
+    except Exception as e:
+        print("Summary printing failed:", repr(e))
 
     # --- DASHBOARD ---
     print("Generating final dashboard...")
@@ -412,13 +708,14 @@ def train_era_rl(config_path='src/configs/default.yaml', save_path='models/era_r
         
         hist['prices'].append(env.S_t)
         hist['deltas'].append(delta)
-        hist['actions'].append(diag['action_mean'])
+        hist['actions'].append(float(np.clip(diag['sampled_action'] * 2.0, -2.0, 2.0)))
         hist['modes'].append(diag['mode'])
         hist['xis'].append(diag['xi'])
-        
-        next_obs, _, term, trunc, _ = env.step(np.array([diag['action_mean']]))
+
+        action_eval = float(np.clip(diag['action_mean'] * 2.0, -2.0, 2.0))
+        next_obs, _, term, trunc, _ = env.step(np.array([action_eval]))
         obs_history.append(torch.tensor(next_obs, dtype=torch.float32, device=device))
-        prev_hedge = torch.tensor([[diag['action_mean']]], device=device)
+        prev_hedge = torch.tensor([[action_eval]], dtype=torch.float32, device=device)
         done = term or trunc
         
     save_dashboard(hist)
