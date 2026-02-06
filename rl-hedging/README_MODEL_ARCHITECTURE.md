@@ -51,6 +51,8 @@ The policy outputs an action in `[-1, 1]` due to `tanh` squashing.
 - Environment action space is `Box(low=-2.0, high=2.0, shape=(1,))` and clips any out-of-range action.
 - In practice, the policy operates within `[-1, 1]` unless you change the squashing or rescale actions.
 
+Implementation note (current code): the mixture heads produce a **scalar action** per step (one hedge ratio), so `means/stds` are shaped `[B, K]` for `K` mixture modes.
+
 ## Environment + “data” the model is trained on
 
 This agent is trained on **synthetic trajectories** generated on-the-fly by a simulator (no historical price dataset is required for ERA-RL training).
@@ -84,9 +86,10 @@ Note: this does *not* mean the policy observes BS delta; by default it does **no
 
 Class: `DualStreamEncoder`
 
-- **Path stream**: GRU over the full `obs_sequence` (shape `[B, T, H]`).
-- **Current stream**: MLP over the last observation `obs_sequence[:, -1, :]` (shape `[B, D]`).
-- **Fusion**: concatenate `(last_gru_state, current_embed)` → MLP + LayerNorm + `tanh`.
+- **Path stream**: GRU over the full `obs_sequence` to produce `gru_out` with shape `[B, T, H]`.
+- **Current stream (query)**: MLP over the last observation `obs_sequence[:, -1, :]` producing `curr_embed` with shape `[B, H]`.
+- **Attention pooling over history**: builds `context_vector = sum_t softmax(score([gru_out_t, curr_embed])) * gru_out_t`.
+- **Fusion**: concatenate `(context_vector, curr_embed)` → MLP + LayerNorm + `tanh` to produce `latent`.
 
 Outputs:
 
@@ -165,6 +168,15 @@ and passes through an MLP torso to produce:
 - mixture logits (mode probabilities)
 - per-mode means
 - per-mode stds (`softplus + 1e-4`)
+
+#### MixtureTanhNormal details (as implemented)
+
+`MixtureTanhNormal` provides:
+
+- `sample()` / `sample_with_mode()`: sample a regime index from `Categorical(logits)` and then sample `z ~ Normal(mean_k, std_k)` and return `tanh(z)`.
+- `log_prob(action)`: uses a numerically-safe `atanh` helper (`_atanh_safe`) and applies the tanh Jacobian correction.
+- `entropy()`: returns categorical entropy plus the mixture-weighted Normal entropy (tanh correction ignored).
+- `mode()`: chooses the argmax regime by logits and returns `tanh(mean)` for that regime.
 
 #### Gradient blocking (stability)
 

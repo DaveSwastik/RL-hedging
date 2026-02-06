@@ -7,9 +7,9 @@ This document describes the training loop implemented in [src/agents/train_era_r
 Training is **on-policy** over simulated hedging episodes:
 
 - The environment generates a full price/vol path per episode (regime-switching Heston).
-- The agent observes a feature vector each step; the trainer feeds the agent an increasing **history window** (`obs_sequence`).
+- The agent observes a feature vector each step; the trainer feeds the agent a fixed-length **history window** (`obs_sequence`) using a deque with padding.
 - The critic learns **distributional value** (quantiles) and a separate **tail model**.
-- The actor learns a **multimodal policy** and is trained with an advantage signal that is adjusted by a **risk penalty**.
+- The actor learns a **multimodal policy** and is trained with a normalized advantage signal (risk metrics are logged and fed as actor features, but the current code does not subtract an explicit risk penalty term in the actor loss).
 
 ## Environment and simulated “data”
 
@@ -47,39 +47,59 @@ Reward is scaled by `reward_scale` and at terminal includes liquidation and term
 
 ## What’s novel in the training setup
 
-### 1) Curriculum via phases (ANCHOR → DISCOVERY → MASTERY)
+### 1) Curriculum via phases (FORCED_ENTRY → STABILIZATION → MASTERY)
 
 The script trains for `n_episodes = 5000` with two phase boundaries:
 
-- `phase_1_end = 20%` of episodes
-- `phase_2_end = 50%` of episodes
+- `phase_1_end = 15%` of episodes (`p1 = 0.15`)
+- `phase_2_end = 75%` of episodes (`p1 + p2` with `p2 = 0.60`)
 
 Per phase:
 
-- **ANCHOR**
+- **FORCED_ENTRY**
+  - `cost_multiplier = 0.0` (transaction costs are effectively “given back” via reward adjustment)
+  - `entropy_coef = 0.05`
   - `shock_prob = 0.0`
-  - `lambda_cvar = 0.0` (no explicit risk penalty)
 
-- **DISCOVERY**
+- **STABILIZATION**
+  - `cost_multiplier = 1.0` (full costs applied)
+  - `entropy_coef = 0.01`
   - `shock_prob = 0.05`
-  - `lambda_cvar` ramps from `0.0` to `0.1`
 
 - **MASTERY**
-  - `shock_prob` increases from `0.05` up to `0.20`
-  - `lambda_cvar = 0.5`
+  - `cost_multiplier = 1.0`
+  - `entropy_coef = 0.005`
+  - `shock_prob = 0.15`
 
-This is an explicit form of curriculum: learn basic hedging first, then learn robustness and tail awareness.
+This is an explicit form of curriculum: learn a stable baseline first, then train under costs and occasional shocks, with lower entropy regularization over time.
 
 ### 2) Adversarial shock injection
 
-During rollout steps (after step 5), the trainer may call `inject_adversarial_shock(env)`:
+During rollout steps in **MASTERY**, the trainer directly mutates the environment state once per episode:
 
-- `S_t <- S_t * (1 - severity)`
-- `V_t <- V_t + 0.20`
+- only when `t > 0.2 * env.n_steps` and with probability `shock_prob / 10` per step
+- applies:
+  - `S_t <- 0.90 * S_t`
+  - `V_t <- V_t + 0.15`
 
 This creates “crash-like” events that are not just a natural outcome of the base simulator, forcing the policy to learn under distribution shift.
 
-### 3) Time-scale separation / two optimizers
+Note: the code enforces **at most one shock per episode** (`episode_shock_triggered`).
+
+### 3) Cost annealing via reward adjustment
+
+The environment already applies costs internally; the training loop additionally computes an implied transaction cost:
+
+- `actual_trade = abs(action_t - prev_hedge) * env.S_t`
+- `implied_cost = actual_trade * trading_cost`
+
+Then adjusts the observed reward:
+
+- `adjusted_reward = raw_reward + implied_cost * (1 - cost_multiplier)`
+
+So when `cost_multiplier = 0.0` (FORCED_ENTRY) the loop adds back the implied cost term, and when `cost_multiplier = 1.0` (STABILIZATION/MASTERY) the reward is unchanged.
+
+### 4) Time-scale separation / two optimizers
 
 Two Adam optimizers are used:
 
@@ -94,7 +114,7 @@ Two Adam optimizers are used:
 
 This stabilizes learning because the EVT tail fit is only meaningful once there are enough tail samples.
 
-### 4) Distributional critic loss (quantile regression with Huber)
+### 5) Distributional critic loss (quantile regression with Huber)
 
 Body critic trains `quantiles` against discounted return targets using `generalized_quantile_huber_loss`.
 
@@ -103,40 +123,52 @@ Body critic trains `quantiles` against discounted return targets using `generali
 
 The weighting term uses $|\tau - \mathbb{1}[target < q]|$ which is standard quantile regression.
 
-### 5) Actor objective with risk-adjusted advantage
+### 6) Actor objective (normalized advantage + entropy)
 
 The actor uses an advantage estimate:
 
 - `advantages = returns - median_quantile_value`
 - normalized (to reduce NaNs during shocks)
 
-Risk penalty is derived from the critic’s tail threshold estimates `u` (saved per step):
+Implementation details (current code in [src/agents/train_era_rl.py](src/agents/train_era_rl.py)):
 
-- `cvar_proxy = episode_us`
-- `risk_penalty = lambda_cvar * abs(min(u, 0))`
-- `adjusted_advantage = advantages - risk_penalty`
+- baseline value per step is taken as the middle quantile index: `quantiles[..., num_quantiles // 2]`
+- advantages are normalized: `(adv - adv.mean()) / (adv.std() + 1e-8)`
+
+The code does compute and log a CVaR-like proxy from the critic (`CVaR_5pct`), but it is not currently subtracted from the advantage inside the actor loss.
 
 Actor loss:
 
-- `actor_loss = -(log_prob(action) * adjusted_advantage).mean()`
+- `actor_loss = -(log_prob(action) * advantages).mean()`
 
-Plus entropy regularization:
+Entropy regularization (phase-dependent `entropy_coef`):
 
-- `entropy_loss = -0.01 * entropy.mean()`
+- `ent_loss = -entropy_coef * entropy.mean()`
 
-### 6) Tail learning with a replay buffer of exceedances
+Total main loss:
+
+- `loss = body_loss + actor_loss + ent_loss`
+
+Stability details:
+
+- gradient clipping: `clip_grad_norm_(agent.parameters(), 0.5)`
+
+### 7) Tail learning with a replay buffer of exceedances
 
 A deque `tail_buffer` stores tuples when a step is classified as a tail event:
 
 - event condition: `return_t < u_t`
-- stored: `(latent_t, padded_gru_history_t, return_t)`
+- stored (normalized shapes): `(latent_t, gru_history_t, return_t_scalar)` where:
+  - `latent_t` is stored as `[H]`
+  - `gru_history_t` is stored as `[T, H]`
+  - `return_t_scalar` is stored as Python `float`
 
-Every `tail_update_freq=10` episodes (and not in ANCHOR), if buffer size >= `k_min=32`:
+Every 10 episodes (`episode % 10 == 0`), if `len(tail_buffer) > 64`:
 
-- sample a batch of 32 latents/returns
+- sample a batch of 64 latents/returns (no replacement)
 - compute tail params `(sigma, xi)` from `tail_net`
-- recompute `u_batch` from the body (no grad)
-- optimize GPD negative log likelihood `gpd_negative_log_likelihood`
+- recompute `u_current` from the critic on the sampled `(latent, gru_history)` (no grad)
+- optimize a stable GPD negative log likelihood with a branch for `xi -> 0`
 
 This creates a hybrid: on-policy main update + off-policy-ish tail fitting over rare events.
 
@@ -144,19 +176,23 @@ This creates a hybrid: on-policy main update + off-policy-ish tail fitting over 
 
 ### Per-step training log
 
-During training, the script appends a per-step record into `training_data_log`:
+During training, the script appends a per-step record into `training_log` with these fields:
 
-- episode, step, phase
-- price, volatility
-- action, reward
-- regime mode (argmax mixture)
-- `xi`, `uncertainty`
-- whether a shock occurred
+- `Episode`, `Step`, `Phase`
+- `Price`, `Action`, `Reward`, `Cost_Mult`
+- `Mode` and per-mode probabilities: `Prob_Mode0`, `Prob_Mode1`, `Prob_Mode2`
+- risk diagnostics: `Xi`, `Uncertainty`, `CVaR_5pct`
+- `Shock`
+- per-episode backfilled summary fields on every row: `EpisodeTotalPnl`, `EpisodeAvgPnlPerStep`, `EpisodeLen`
 
 Saved at the end to:
 
-- `training_data_log.xlsx` (preferred)
-- fallback `training_data_log.csv` if Excel writer deps are missing
+- `training_log_v2(5k-episodes).csv` (step-level)
+- `episode_summaries(5k-episodes).csv` (episode-level)
+
+The model checkpoint is saved to:
+
+- `models/era_rl_v2(5k-episodes).pth`
 
 ### Final diagnostic dashboard
 
