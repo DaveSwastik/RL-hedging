@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal, Categorical, MixtureSameFamily
+from torch.distributions import Normal, Categorical
 
 # -------------------------------------------------------------------
 # 1. UTILITIES & ROBUST LAYERS
@@ -51,11 +51,19 @@ class MixtureTanhNormal:
         self.cat_dist = Categorical(logits=categorical_logits)
         self.means = means
         self.stds = stds
+
+    @staticmethod
+    def _atanh_safe(x):
+        # Works on all PyTorch versions
+        return 0.5 * (torch.log1p(x.clamp(-0.999999, 0.999999)) - 
+                      torch.log1p((-x).clamp(-0.999999, 0.999999)))
         
     def sample(self):
         # 1. Pick a mode (Regime)
         # indices: [B]
         mode_indices = self.cat_dist.sample()
+        # Expose sampled mode for logging/debugging
+        self.last_mode_indices = mode_indices
         
         # Sample one z from each component, then pick based on mode
         z = torch.normal(self.means, self.stds)  # [B, K] (scalar action) or [B, K, D]
@@ -63,46 +71,57 @@ class MixtureTanhNormal:
         chosen_z = z[torch.arange(z.size(0)), mode_indices]
         return torch.tanh(chosen_z)
 
-    def log_prob(self, action):
-        # Log prob of Mixture is log(sum(exp(log_probs)))
-        # For tanh correction: log_prob(a) = log(sum(pi_k * N(atanh(a)|mu_k, sigma_k))) - log(1-a^2)
-        
-        # Numerical stability clamp
-        action_unsquashed = torch.atanh(torch.clamp(action, -0.999999, 0.999999))
-        
-        # Ensure shape compatibility
-        if action_unsquashed.dim() == 0:
-            action_unsquashed = action_unsquashed.unsqueeze(0)
-        if action_unsquashed.dim() == 1:
-            action_unsquashed = action_unsquashed.unsqueeze(-1)  # [B, 1]
+    def sample_with_mode(self):
+        """Samples an action and also returns the sampled regime index."""
+        mode_indices = self.cat_dist.sample()
+        self.last_mode_indices = mode_indices
+        z = torch.normal(self.means, self.stds)
+        chosen_z = z[torch.arange(z.size(0)), mode_indices]
+        return torch.tanh(chosen_z), mode_indices
 
-        # Component log_probs: [B, K]
-        action_expanded = action_unsquashed.unsqueeze(1)  # [B, 1, 1]
-        comp_lp = Normal(self.means.unsqueeze(-1), self.stds.unsqueeze(-1)).log_prob(action_expanded)
-        comp_log_probs = comp_lp.sum(dim=-1)  # sum over action dims
-        
-        # Mix with categorical logits
-        # mixture_log_prob = logsumexp(logits + comp_log_probs) - logsumexp(logits)
-        mixed_log_prob = torch.logsumexp(self.cat_dist.logits + comp_log_probs, dim=1) - \
-                         torch.logsumexp(self.cat_dist.logits, dim=1)
-        
-        # Jacobian correction
-        # Jacobian correction: sum over action dims
-        if action.dim() == 0:
-            action = action.unsqueeze(0)
-        if action.dim() == 1:
-            action = action.unsqueeze(-1)
-        jacobian = torch.log1p(-action.pow(2) + 1e-12).sum(dim=-1)
-        
+    def log_prob(self, action):
+        # ----- Unsquash with numerical safety -----
+        a = torch.clamp(action, -0.999999, 0.999999)
+        action_unsquashed = self._atanh_safe(a)
+
+        # Ensure shape [B,1] for scalar action
+        if action_unsquashed.dim() == 1:
+            action_unsquashed = action_unsquashed.unsqueeze(-1)
+
+        # ----- Component log-probs -----
+        # means/stds are [B,K] for scalar action
+        normal = Normal(self.means, self.stds)
+
+        # Expand action -> [B,1]
+        action_expanded = action_unsquashed  # already [B,1]
+
+        # Compute per-component log prob [B,K]
+        comp_log_probs = normal.log_prob(action_expanded)  # broadcast OK
+
+        # ----- Mixture aggregation -----
+        logits = self.cat_dist.logits  # [B,K]
+
+        mixed_log_prob = torch.logsumexp(logits + comp_log_probs, dim=-1) - \
+                         torch.logsumexp(logits, dim=-1)
+
+        # ----- Tanh Jacobian correction -----
+        jacobian = torch.log1p(
+            -a.pow(2).clamp(max=1.0 - 1e-12)
+        ).sum(dim=-1)
+
         return mixed_log_prob - jacobian
 
     def entropy(self):
-        """Approximate entropy (ignores tanh squashing correction)."""
-        # Categorical entropy + expected Normal entropy (per component)
-        cat_ent = self.cat_dist.entropy()  # [B]
-        comp_ent = Normal(self.means, self.stds).entropy()  # [B, K]
-        weights = torch.softmax(self.cat_dist.logits, dim=-1)  # [B, K]
-        mix_ent = (weights * comp_ent).sum(dim=-1)  # [B]
+        # Categorical part: [B]
+        cat_ent = self.cat_dist.entropy()
+
+        # Normal part: for scalar action -> [B,K]
+        comp_ent = Normal(self.means, self.stds).entropy()
+
+        # Weighted mixture entropy
+        weights = torch.softmax(self.cat_dist.logits, dim=-1)  # [B,K]
+        mix_ent = (weights * comp_ent).sum(dim=-1)             # [B]
+
         return cat_ent + mix_ent
 
     def mode(self):
@@ -118,93 +137,143 @@ class MixtureTanhNormal:
 class DualStreamEncoder(nn.Module):
     def __init__(self, obs_dim, hidden_dim=128):
         super().__init__()
-        # Path Stream (GRU)
+        # 1. Path Stream (GRU)
         self.gru = nn.GRU(obs_dim, hidden_dim, batch_first=True)
-        # Trajectory Attention for Critic (Fix Gap 4)
-        self.traj_attn = nn.Linear(hidden_dim, 1)
         
-        # Current Features Stream
+        # 2. Current Features Stream (The "Query" Generator)
         self.current_net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim // 2),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2)
+            nn.Linear(hidden_dim // 2, hidden_dim) # Project to match GRU dim
         )
         
+        # 3. Attention Mechanism (The "Search Engine")
+        self.attention_score = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), # Input: [History_State + Current_Query]
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # 4. Final Fusion
+        # Input: [Attended_History_Context + Current_Embed]
         self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim + (hidden_dim // 2), hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.Tanh()
         )
 
     def forward(self, obs_sequence, prev_hedge):
-        # 1. Path Processing
-        gru_out, _ = self.gru(obs_sequence) # [B, T, H]
+        B = obs_sequence.size(0)
+        device = obs_sequence.device
         
-        # 2. Trajectory Risk Awareness (Fix Gap 4)
-        # Instead of just last state, we keep the full sequence for the critic
-        # to perform "Trajectory Attention"
+        # --- A. Contextual Initialization (Same as before) ---
+        if prev_hedge is None:
+            prev_hedge_feat = torch.zeros(B, 1, device=device)
+        else:
+            prev_hedge_feat = prev_hedge.reshape(B, -1)[:, 0:1] # Ensure [B, 1]
+
+        h0 = torch.tanh(prev_hedge_feat).expand(-1, self.gru.hidden_size).unsqueeze(0)
         
-        # 3. Last State Context (Standard)
-        last_context = gru_out[:, -1, :]
+        # --- B. Process History ---
+        # gru_out: [Batch, 30, Hidden] -> The full memory tape
+        gru_out, _ = self.gru(obs_sequence, h0)
         
-        # 4. Current Features
-        current_obs = obs_sequence[:, -1, :]
-        curr_embed = self.current_net(current_obs)
+        # --- C. Process Current State (The Query) ---
+        current_obs = obs_sequence[:, -1, :] # The most recent market tick
+        curr_embed = self.current_net(current_obs) # [Batch, Hidden]
         
-        # 5. Fusion
-        latent = self.fusion(torch.cat([last_context, curr_embed], dim=-1))
+        # --- D. Attention Pooling (The Upgrade) ---
+        # We want to check: "Which past steps match the current situation?"
         
-        return latent, gru_out # Return full history for critic
+        # 1. Expand query to match time dimension
+        # [Batch, 1, Hidden]
+        query_expanded = curr_embed.unsqueeze(1).expand(-1, gru_out.size(1), -1)
+        
+        # 2. Concat History (Keys) with Query
+        # [Batch, 30, Hidden*2]
+        combined = torch.cat([gru_out, query_expanded], dim=-1)
+        
+        # 3. Calculate Scores and Weights
+        # scores: [Batch, 30, 1]
+        scores = self.attention_score(combined)
+        weights = F.softmax(scores, dim=1)
+        
+        # 4. Weighted Sum (Context Vector)
+        # Sum( [Batch, 30, H] * [Batch, 30, 1] ) -> [Batch, H]
+        context_vector = torch.sum(gru_out * weights, dim=1)
+        
+        # --- E. Final Latent Representation ---
+        # Combine the "Context of the past" with the "Reality of now"
+        latent = self.fusion(torch.cat([context_vector, curr_embed], dim=-1))
+        
+        return latent, gru_out
 
 # -------------------------------------------------------------------
-# 3. HYBRID CRITIC (Fix Gap 4, 5, 7)
+# 3. HYBRID CRITIC (Corrected & Patched)
 # -------------------------------------------------------------------
 
 class HybridDistributionalCritic(nn.Module):
     def __init__(self, latent_dim, num_quantiles=32):
         super().__init__()
-        # --- ADD THIS LINE ---
-        self.num_quantiles = num_quantiles 
-        # ---------------------
+        self.num_quantiles = num_quantiles
         
-        # Trajectory Attention Head (Fix Gap 4)
-        self.traj_query = nn.Linear(latent_dim, 1)
+        # 1. Trajectory Attention Head (The Fix)
+        # Calculates relevance of each history step to the current state
+        self.attention_score = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.Tanh(),
+            nn.Linear(latent_dim, 1)
+        )
         
-        # Body: Monotonic Quantiles (Fix Gap 5)
+        # 2. Body: Monotonic Quantiles
+        # Input is now the weighted context vector
         self.body_net = nn.Sequential(
             nn.Linear(latent_dim, 256),
             nn.LeakyReLU(),
-            MonotonicQuantileLayer(256, num_quantiles)
+            # We use the class output directly here for cleanliness
         )
+        self.quantile_layer = MonotonicQuantileLayer(256, num_quantiles)
         
-        # Tail: GPD
+        # 3. Tail: GPD Parameters
         self.tail_net = nn.Sequential(
             nn.Linear(latent_dim, 64),
             nn.SiLU(),
             nn.Linear(64, 2) # Sigma, Xi
         )
         
-        # Uncertainty Head
+        # 4. Uncertainty Head
         self.uncertainty_net = nn.Linear(latent_dim, 1)
 
     def forward(self, latent, gru_history):
-        # 1. Trajectory Awareness (Fix Gap 4)
-        # We re-weight the latent state based on history severity
-        # (Simplified attention for brevity)
-        # In full version: use MultiHeadAttention(query=latent, key=gru_history)
+        # --- ATTENTION MECHANISM ---
+        # Expand latent to broadcast: [B, H] -> [B, 1, H]
+        latent_expanded = latent.unsqueeze(1)
         
-        # 2. Body (Monotonic)
-        quantiles = self.body_net(latent)
+        # Combine history [B, T, H] with current latent [B, 1, H]
+        # This determines "how similar was the past to right now?"
+        combined = torch.tanh(gru_history + latent_expanded)
         
-        # 3. Consistency
+        # Calculate scores: [B, T, 1]
+        scores = self.attention_score(combined)
+        weights = F.softmax(scores, dim=1)
+        
+        # Context Vector: Weighted sum of history
+        context_vector = torch.sum(gru_history * weights, dim=1) # [B, H]
+        
+        # --- PREDICTIONS ---
+        # 1. Quantiles (using context)
+        body_feat = self.body_net(context_vector)
+        quantiles = self.quantile_layer(body_feat)
+        
+        # 2. Consistency Threshold (First quantile)
         u_threshold = quantiles[:, 0].unsqueeze(1).detach()
         
-        # 4. Tail
-        raw_tail = self.tail_net(latent)
+        # 3. Tail (using current latent is usually fine, or use context)
+        raw_tail = self.tail_net(latent) 
         sigma = robust_softplus(raw_tail[:, 0:1]) + 1e-4
         xi = torch.tanh(raw_tail[:, 1:2]) * 0.5
         
-        # 5. Uncertainty
+        # 4. Uncertainty
         uncertainty = torch.sigmoid(self.uncertainty_net(latent))
         
         return {
@@ -264,7 +333,7 @@ class MixtureActor(nn.Module):
         stds = F.softplus(self.stds_head(x)) + 1e-4
         
         # Return distribution object for loss calculation
-        # (Custom wrapper needed for PyTorch MixtureSameFamily with Tanh)
+
         return MixtureTanhNormal(logits, means, stds)
 
 # -------------------------------------------------------------------
@@ -300,7 +369,7 @@ class ERARL_Agent_V2(nn.Module):
         xi = risk_out['xi']
         
         # CVaR Formula (Exceedance)
-        cvar = u - (sigma / (1 - xi))
+        cvar = u + (sigma / (1 - xi))
         return cvar
 
     def get_diagnostics(self, obs_sequence, prev_hedge):

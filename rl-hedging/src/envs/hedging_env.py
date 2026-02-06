@@ -19,6 +19,8 @@ class HedgingEnv(gym.Env):
         self.option_spec = option_spec
         self.trading_cost = trading_cost
         self.payoff_fn = PAYOFF_FUNCTIONS[option_spec['type']]
+        self.dt = sim_params.get('dt', 1/252)   #for dashboard
+        self.n_steps = sim_params['steps']      #updated
         self.T = sim_params['steps']
         
         # --- *** THIS IS THE FIX *** ---
@@ -178,16 +180,18 @@ class HedgingEnv(gym.Env):
         spot_price = self.S_path[self.t_idx]
         volatility = np.sqrt(self.v_path[self.t_idx])
         
+        s0_ref = self.sim_params.get('S0', self.sim_params.get('init_S', 100.0))
+
         running_avg = self.running_sum / (self.t_idx + 1)
         
         # Normalize features for better NN performance
         obs = np.array([
             time_normalized,
-            spot_price / self.sim_params['S0'],
+            spot_price / s0_ref,  # Uses the safe reference
             volatility,
             self.position,
-            running_avg / self.sim_params['S0'],
-            self.running_max / self.sim_params['S0']
+            running_avg / s0_ref, # Uses the safe reference
+            self.running_max / s0_ref # Uses the safe reference
         ], dtype=np.float32)
         return obs
 

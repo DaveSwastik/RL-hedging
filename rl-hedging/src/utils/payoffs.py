@@ -17,6 +17,6 @@ def lookback_option_payoff(S_path, K, option_type='call'):
 # Add other payoffs (barrier, cliquet) here as needed.
 
 PAYOFF_FUNCTIONS = {
-    'Asian': asian_option_payoff,
-    'Lookback': lookback_option_payoff,
+    'asian': asian_option_payoff,    
+    'lookback': lookback_option_payoff, 
 }

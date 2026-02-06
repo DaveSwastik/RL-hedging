@@ -1,102 +1,156 @@
-# src/configs/default.yaml
-# Single unified experiment config (simulator + env + model + training + eval)
-
-# -----------------------
-# Simulator Parameters
-# -----------------------
-simulator:
-  S0: 100.0
-  v0: 0.04
-  dt: 0.004       # time step in years
-  steps: 20       # number of timesteps per episode (smoke test)
-  rho: -0.7
-  r: 0.01         # risk-free rate used by BS proxy
-  reward_scale: 1e4   # scale for per-step squared reward (tune)
-  regimes:
-    - { name: "Low Vol",  theta: 0.04, kappa: 3.0, sigma_v: 0.2, mu: 0.05 }
-    - { name: "High Vol", theta: 0.16, kappa: 1.5, sigma_v: 0.4, mu: 0.05 }
-    - { name: "Crisis",   theta: 0.36, kappa: 1.0, sigma_v: 0.6, mu: -0.1 }
-  trans_mat:
-    - [0.98, 0.015, 0.005]
-    - [0.02, 0.97, 0.01]
-    - [0.05, 0.05, 0.90]
-
-# -----------------------
-# Option Specification
-# -----------------------
-option:
-  type: "Asian"          # 'Asian', 'Lookback', 'Barrier' (select payoff in PAYOFF_FUNCTIONS)
-  K: 100.0
-  maturity: 0.08         # years (should equal dt * steps)
-  option_type: "call"    # 'call' or 'put'
-  notional: 1.0
-
-# -----------------------
-# Environment Configuration
-# -----------------------
+# ---------------------------
+# Environment & Simulator
+# ---------------------------
 environment:
-  trading_cost: 0.001    # proportional trading cost per trade (e.g., 10 bps)
-  reward_fn: "squared_error"  # 'squared_error' or 'pnl'
-  trade_penalty: 0.01    # additional penalty on trading volume if desired
-  obs_normalize: true    # use running mean/std normalization
-  include_delta_feature: false  # whether to expose BS delta as an observation
-
-# -----------------------
-# Model / Agent Settings
-# -----------------------
-model:
-  agent_type: "A2C"      # "A2C" or "PPO"
-  obs_dim: 6
-  hidden_dim: 128
-  use_layernorm: false
-  state_dependent_std: false
-
-# -----------------------
-# A2C/CVaR specific hyperparameters
-# -----------------------
-a2c:
-  n_envs: 16
-  rollout_length: 50
-  lr_actor: 1e-5
-  lr_critic: 1e-4
-  gamma: 0.995
-  gae_lambda: 0.95
-  entropy_coef: 0.01
-  value_coef: 0.5
-  cvar_lambda: 1.0         # penalty multiplier for CVaR
-  quantile_weight: 1.0
-  n_quantiles: 32
-  max_grad_norm: 0.5
-  advantage_clip: 10.0
-  clip_adv_by_std: false
-  total_updates: 2000
-
-# -----------------------
-# PPO fallback (if you run PPO)
-# -----------------------
-ppo:
-  n_envs: 16
-  rollout_length: 2048
-  batch_size: 64
-  n_epochs: 10
-  lr: 3e-4
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_range: 0.2
-  entropy_coef: 0.0
-  value_coef: 0.5
-  total_timesteps: 100000
-
-# -----------------------
-# Evaluation & Logging
-# -----------------------
-evaluation:
-  eval_interval: 50
-  eval_episodes: 50
-  ins_window_days: 252
-  oos_window_days: 63
-
-logging:
-  logdir: ./runs/experiment_default
-  save_interval: 50
+  trading_cost: 0.0002        # per-dollar traded cost (2 bps) — used by env and training
   seed: 42
+  device: "auto"              # "auto" -> script chooses cuda if available
+
+# ADD THIS: 3x3 Transition Matrix for your 3 regimes
+  # Row 0 (LowVol): 94% stay, 5% go to HighVol, 1% go to Crisis
+  # Row 1 (HighVol): 10% go to LowVol, 85% stay, 5% go to Crisis
+  # Row 2 (Crisis): 5% go to LowVol, 15% go to HighVol, 80% stay
+
+simulator:
+  steps: 30                   # episode length (days). set 30 for the "memory window" you wanted
+  dt: 0.00396825396                   # daily timestep (approx), used by env
+  S0: 100.0
+  V0: 0.2
+
+  trans_mat: 
+    - [0.94, 0.05, 0.01]
+    - [0.10, 0.85, 0.05]
+    - [0.05, 0.15, 0.80]
+  regimes:
+    - name: "LowVol"
+      prob: 0.94
+      mu: 0.0
+      theta: 0.04    # Long-term variance (20% vol squared)
+      kappa: 2.0     # Fast mean reversion
+      sigma_v: 0.1   # Low vol-of-vol
+    - name: "HighVol"
+      prob: 0.05
+      mu: 0.0
+      theta: 0.09    # Long-term variance (30% vol squared)
+      kappa: 1.0     # Slower mean reversion
+      sigma_v: 0.3   # High vol-of-vol
+    - name: "Crisis"
+      prob: 0.01
+      mu: -0.05
+      theta: 0.25    # Long-term variance (50% vol squared)
+      kappa: 0.5     # Very slow recovery
+      sigma_v: 0.5   # Extreme vol-of-vol
+
+# ---------------------------
+# Option / Hedging Instrument
+# ---------------------------
+option:
+  type: "asian"               # matches your planned path-dependent option (memory matters)
+  K: 100.0
+  maturity_years: 0.08        # fraction of year
+  notional: 1.0
+  payoff: "call"              # or "put"
+  include_delta_feature: false
+
+# ---------------------------
+# Agent / Model hyperparameters
+# ---------------------------
+model:
+  agent_type: "ERARL_Agent_V2"
+  obs_dim: null               # auto-filled at runtime from env.observation_space
+  hidden_dim: 128
+  num_quantiles: 32
+  num_modes: 3
+  action_dim: 1               # scalar hedge ratio (keep 1 for your single underlying)
+  encoder:
+    gru_num_layers: 1
+    gru_bidirectional: false
+
+# ---------------------------
+# Training schedule & optimizers
+# ---------------------------
+training:
+  n_episodes: 1000            # default training length (override for smoke tests)
+  seq_len: 30                 # sliding window length fed to encoder (match simulator.steps)
+  gamma: 0.99
+
+  # phases roughly match the script: fractions of n_episodes
+
+  # currently taking hardcioded values from training script
+  phases:
+    phase1_frac: 0.15         # FORCED_ENTRY
+    phase2_frac: 0.60         # STABILIZATION
+    phase3_frac: 0.25
+    # MASTERY implied as remaining fraction
+
+  # per-phase hyperparameters (used to construct schedules in train script)
+  phase_settings:
+    FORCED_ENTRY:
+      cost_multiplier: 0.0
+      entropy_coef: 0.05
+      shock_prob: 0.0
+    STABILIZATION:
+      cost_multiplier: 1.0
+      entropy_coef: 0.01
+      shock_prob: 0.05
+    MASTERY:
+      cost_multiplier: 1.0
+      entropy_coef: 0.005
+      shock_prob: 0.15
+
+  # optimizer learning rates (mapped to parameters in your script)
+  optimizer:
+    type: "adam"
+    encoder_lr: 3e-4
+    actor_lr: 1e-4
+    critic_body_lr: 3e-4
+    critic_uncertainty_lr: 3e-4
+    tail_lr: 5e-5
+    grad_clip_norm: 0.5
+
+# ---------------------------
+# Tail & EVT (GPD) training
+# ---------------------------
+tail:
+  enabled: true
+  buffer_maxlen: 2000
+  min_buffer_for_update: 64
+  batch_size: 64
+  update_every_episodes: 10   # run a tail update every N episodes (as in your script)
+  xi_clamp: [-0.999, 0.999]
+  sigma_min: 1e-6
+  small_xi_threshold: 1e-6
+
+# ---------------------------
+# Logging, saving, evaluation
+# ---------------------------
+logging:
+  training_log_path: "training_log_v2.csv"
+  episode_summary_path: "episode_summaries.csv"
+  save_model_path: "models/era_rl_v2.pth"
+  save_every_episodes: 100
+  generate_dashboard: true
+  dashboard_path: "training_mastery_report.png"
+
+# ---------------------------
+# Reward & evaluation
+# ---------------------------
+reward:
+  fn: "squared_error"         # default: squared hedging replication error (your script)
+  include_trading_costs: true
+
+evaluation:
+  run_after_training: true
+  eval_seed: 123
+  eval_episodes: 1
+  record_history: true        # collects prices, deltas, actions, modes, xis for dashboard
+
+# ---------------------------
+# Misc / debug
+# ---------------------------
+misc:
+  seed: 42
+  smoke_test:
+    enabled: true
+    n_episodes: 5             # override n_episodes for quick smoke runs
+    seq_len: 10               # shorter sequence for smoke tests
