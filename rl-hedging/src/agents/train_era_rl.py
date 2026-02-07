@@ -90,7 +90,7 @@ def empirical_cvar(values, alpha=0.05):
 
 def train_era_rl(
     config_path='src/configs/default.yaml',
-    save_path='models/era_rl_v2(test5(5k)).pth',
+    save_path='models/era_rl_v2(test6(5k)).pth',
     # n_episodes_override: int | None = None,
 ):
     cfg = load_config(config_path)
@@ -102,7 +102,8 @@ def train_era_rl(
     real_cost = cfg['environment'].get('trading_cost', 0.0002)      # 2BP
     env = HedgingEnv(cfg['simulator'], cfg['option'], trading_cost=real_cost)
     
-    obs_dim = env.observation_space.shape[0]
+    # We append running average A_t (normalized) as an extra feature
+    obs_dim = env.observation_space.shape[0] + 1
     agent = ERARL_Agent_V2(obs_dim=obs_dim, hidden_dim=128).to(device)
 
     # 2. Optimizers
@@ -128,7 +129,7 @@ def train_era_rl(
     optimizer_tail = optim.Adam(agent.critic.tail_net.parameters(), lr=5e-5)
 
     # 3. Training Config
-    n_episodes = 100          # full training (use smaller for smoke tests)
+    n_episodes = 5000          # full training (use smaller for smoke tests)
     seq_len = 30
 
     # # QUICK TEST: you can override to e.g. 200 for fast runs
@@ -149,8 +150,11 @@ def train_era_rl(
     IMITATION_END_WEIGHT = 0.0       # decays to this over EPISODES_IMITATE
 
     # Relative CVaR objective hyperparams (tuned for better PnL balance)
-    LAMBDA_REL = 1.0
-    LAMBDA_CVAR = 0.01   # WAS 0.05: Reduced to stop the "Pessimism Gap"
+    # NOTE: the training objective is now replication-loss based (not PnL-vs-BS)
+    LAMBDA_CVAR_NEW = 0.3    # weight on critic CVaR term
+    LAMBDA_TURN = 0.1        # turnover penalty
+    LAMBDA_REG = 0.01        # L2 on action
+    KAPPA = 30.0             # terminal replication penalty weight
     
     # Buffers
     tail_buffer = deque(maxlen=2000)
@@ -186,14 +190,22 @@ def train_era_rl(
         obs, _ = env.reset()
         episode_shock_triggered = False # Ensure only one massive shock per ep
 
-        
-        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
+
+        # --- Running average A_t (for Asian/path dependence) ---
+        # If env doesn't provide A_t, we compute and append it.
+        running_sum = float(env.S_t)
+        running_count = 1
+        notional = max(1.0, cfg['option'].get('notional', cfg['option'].get('K', 1.0)))
+        A_t = running_sum / running_count
+
+        obs_with_A = np.concatenate([np.asarray(obs, dtype=np.float32), np.asarray([A_t / notional], dtype=np.float32)])
+        obs_tensor = torch.tensor(obs_with_A, dtype=torch.float32, device=device)
         obs_history = deque([obs_tensor for _ in range(seq_len)], maxlen=seq_len)
         
         # stable prev_hedge shapes (actor position)
         prev_hedge = torch.tensor([[0.0]], device=device)
 
-        # BS baseline bookkeeping (scalar floats)
+        # BS baseline bookkeeping (scalar floats) - diagnostics / warm-start only
         bs_prev_hedge = 0.0
         prev_V = env.V_t  # variance state (used to form sigma for BS delta)
         
@@ -211,9 +223,10 @@ def train_era_rl(
         ep_mode_probs = []
         ep_bs_deltas = []
 
-        # --- Patch: keep raw RL PnL and adjusted reward separate ---
-        ep_rl_raw_rewards = []   # raw pnl from environment (rl_pnl)
-        ep_rewards_adj = []      # adjusted reward (adv - lambda * cvar)
+        # Raw hedged PnL stream + reward stream
+        ep_rl_raw_rewards = []   # raw hedged pnl (delta_pnl)
+        ep_rewards_adj = []      # replication-loss reward
+        ep_norm_losses = []      # normalized positive loss magnitudes (for tail buffer)
         
         done = False
         t = 0
@@ -240,19 +253,12 @@ def train_era_rl(
 
             dist = agent.actor(latent, risk_out)
             
-            # Sample Action
-            action_tanh, mode_idx = dist.sample_with_mode()  # tanh-space action in [-1, 1]
-            if phase != "MASTERY":   # allow more exploration in early phases
-                noise = float(np.random.normal(scale=0.15))   # was 0.08
-            else:
-                noise = float(np.random.normal(scale=0.1))   # was 0.02
+            # Sample Action (MixtureSigmoidNormal -> returns in (0,1))
+            action_sample, mode_idx = dist.sample_with_mode()  # already in (0,1)
+            action_val = float(np.clip(float(action_sample.item()) + np.random.normal(scale=0.02), 0.0, 1.0))
 
-            # --- Patch 1 + 2: Scale to env range [-2,2] and add stronger exploration ---
-            action_val = float(np.clip(float(action_tanh.item()) * 1.2, -0.5, 1.2))
-            action_val = float(np.clip(action_val + noise, -0.5, 1.2))
-
-            # Keep a tanh-space proxy action for log_prob/prev_hedge encoding
-            action_for_logprob = torch.tensor([[action_val / 2.0]], dtype=torch.float32, device=device)
+            # For log-prob evaluation, pass the [0,1] action
+            action_for_logprob = torch.tensor([[action_val]], dtype=torch.float32, device=device)
 
             # --- Optional: capture regime probabilities for analysis ---
             with torch.no_grad():
@@ -274,24 +280,42 @@ def train_era_rl(
             # Store prev_price in info for downstream logging/analysis
             info['prev_price'] = prev_price
 
-            # Discrete tick PnLs (unscaled): RL uses env's hedger PnL; BS uses same d_option + dS
-            rl_pnl = float(info.get('pnl_hedger', raw_reward))
-
+            # -------------------------------------------------------------
+            # Replication-loss reward (NO PnL-vs-BS objective)
+            # compute discrete hedged pnl (seller of 1 option, holding a_prev units of underlying)
+            dV = float(info.get('d_option', 0.0))
             dS = float(env.S_t - prev_price)
-            d_option = float(info.get('d_option', 0.0))
-            bs_trade = abs(bs_delta - bs_prev_hedge) * prev_price
-            bs_tx_cost = bs_trade * real_cost
-            bs_pnl = (-d_option) + (bs_prev_hedge * dS) - bs_tx_cost
+            trade_size = float(abs(action_val - prev_hedge.item()))
+            tx_cost = float(real_cost * trade_size * env.S_t)
 
-            # CVaR estimate from critic (parametric GPD head)
+            # discrete hedged portfolio change (Delta Pi)
+            delta_pnl = float((-dV) + (prev_hedge.item() * dS) - tx_cost)
+            L_t = float(-delta_pnl)  # loss = -PnL (positive = bad)
+            normL = float(L_t / notional)
+
+            # CVaR estimate from critic (parametric tail head)
             # risk_out already computed above (before stepping env)
             cvar_val = agent.compute_risk_penalty(risk_out, alpha=0.05).item()
 
-            # Relative CVaR objective
-            advantage = rl_pnl - bs_pnl
-            turnover = abs(action_val - prev_hedge.item())
-            smoothness_penalty = 0.05 * turnover
-            adjusted_reward = (LAMBDA_REL * advantage) - (LAMBDA_CVAR * cvar_val) - smoothness_penalty
+            reward = - (normL ** 2) \
+                     - (LAMBDA_CVAR_NEW * cvar_val) \
+                     - (LAMBDA_TURN * trade_size) \
+                     - (LAMBDA_REG * (action_val ** 2))
+
+            # Terminal replication penalty (apply to final step reward)
+            terminal_rep_err = np.nan
+            terminal_penalty = 0.0
+            if terminated or truncated:
+                accumulated_hedged_pnl = float(np.sum(ep_rl_raw_rewards) + delta_pnl)
+                payoff = float(info.get('payoff', 0.0))
+                terminal_rep_err = float(payoff - accumulated_hedged_pnl)
+                terminal_penalty = float(-KAPPA * (terminal_rep_err / notional) ** 2)
+                reward = float(reward + terminal_penalty)
+
+            # Diagnostics baseline (BS delta hedge) - NOT used in reward
+            bs_trade = abs(bs_delta - bs_prev_hedge) * prev_price
+            bs_tx_cost = bs_trade * real_cost
+            bs_pnl = (-dV) + (bs_prev_hedge * dS) - bs_tx_cost
             
 
             # Optional: keep annealing of explicit transaction refund if desired
@@ -315,7 +339,7 @@ def train_era_rl(
                 "PrevPrice": float(info.get('prev_price', env.S_t)),
                 "PriceRet": float(price_ret),
                 "Action": action_val,
-                "Reward": adjusted_reward,
+                "Reward": float(reward),
                 "Cost_Mult": cost_multiplier,
                 "Mode": mode_idx.item(),
 
@@ -332,10 +356,17 @@ def train_era_rl(
 
                 "CVaR_5pct": cvar_val,          # added for benchmarking
 
+                # Replication-loss diagnostics
+                "Loss_t": float(L_t),
+                "NormLoss": float(normL),
+                "TradeSize": float(trade_size),
+                "TxCost": float(tx_cost),
+                "TerminalRepErr": float(terminal_rep_err) if np.isfinite(terminal_rep_err) else np.nan,
+                "TerminalPenalty": float(terminal_penalty),
+
                 # Baseline diagnostics
-                "RL_PnL": float(rl_pnl),
+                "RL_PnL": float(delta_pnl),
                 "BS_PnL": float(bs_pnl),
-                "Advantage": float(advantage),
                 "BS_Delta": float(bs_delta),
 
                 "EpisodeTotalPnl": np.nan,      # Placeholder
@@ -369,14 +400,22 @@ def train_era_rl(
             ep_latents.append(latent.detach()) 
             ep_grus.append(gru_hist.detach())
             ep_us.append(float(risk_out['u'].item()))
-            ep_rl_raw_rewards.append(float(rl_pnl))
-            ep_rewards_adj.append(float(adjusted_reward))
+            ep_rl_raw_rewards.append(float(delta_pnl))
+            ep_rewards_adj.append(float(reward))
+            ep_norm_losses.append(float(max(normL, 0.0)))
             ep_values.append(risk_out['quantiles'][0, agent.critic.num_quantiles // 2])
             ep_actions.append(action_val)
             ep_price_rets.append(float(price_ret))
             
             # Update State
-            obs_history.append(torch.tensor(next_obs, dtype=torch.float32, device=device))
+            running_sum += float(env.S_t)
+            running_count += 1
+            A_t = running_sum / running_count
+            next_obs_with_A = np.concatenate([
+                np.asarray(next_obs, dtype=np.float32),
+                np.asarray([A_t / notional], dtype=np.float32),
+            ])
+            obs_history.append(torch.tensor(next_obs_with_A, dtype=torch.float32, device=device))
             
             # --- PATCH 2: Stable prev_hedge shape ---
             prev_hedge = torch.tensor([[action_val]], dtype=torch.float32, device=device)
@@ -388,6 +427,9 @@ def train_era_rl(
         episode_total_pnl = float(info.get('terminal_pnl', np.sum(ep_rl_raw_rewards)))
         episode_avg_pnl_per_step = float(np.mean(ep_rl_raw_rewards)) if len(ep_rl_raw_rewards) > 0 else 0.0
         episode_len = t
+
+        # terminal replication error (logged at last step if provided)
+        terminal_rep_err_ep = float(info.get('payoff', 0.0) - episode_total_pnl) if episode_len > 0 else 0.0
 
         # --- Patch 5: Episode-end diagnostics ---
         action_std = float(np.std(ep_actions)) if len(ep_actions) > 0 else 0.0
@@ -430,6 +472,8 @@ def train_era_rl(
             'EpisodeTotalPnl': episode_total_pnl,
             'EpisodeAvgPnlPerStep': episode_avg_pnl_per_step,
             'EpisodeLen': episode_len,
+
+            'TerminalRepErr': terminal_rep_err_ep,
 
             # --- NEW METRICS ---
             'Empirical_RL_CVaR': emp_rl_cvar,
@@ -495,15 +539,14 @@ def train_era_rl(
 
         # B. Tail Buffer Population (robust): add worst 20% (at least 3) returns_raw
         tail_added = 0
-        if len(ep_rl_raw_rewards) > 0:
-            k = max(3, int(0.20 * len(ep_rl_raw_rewards)))
-            worst_idx = np.argsort(returns_raw.detach().cpu().numpy().squeeze())[:k]
+        if len(ep_norm_losses) > 0:
+            k = max(3, int(0.20 * len(ep_norm_losses)))
+            worst_idx = np.argsort(np.asarray(ep_norm_losses))[-k:]
             for i in worst_idx:
-                
                 _latent = ep_latents[int(i)].detach().squeeze(0)  # [H]
                 _gru = ep_grus[int(i)].detach().squeeze(0)        # [T,H]
-                # KEY FIX: store positive loss magnitude for GPD fitting
-                _loss_mag = -float(returns_raw[int(i)].detach().squeeze().item())
+                # store normalized positive loss magnitude for GPD fitting
+                _loss_mag = float(ep_norm_losses[int(i)])
                 tail_buffer.append((_latent, _gru, _loss_mag))
                 tail_added += 1
 
@@ -561,17 +604,14 @@ def train_era_rl(
             imit_loss = torch.tensor(0.0, device=device)
             imit_weight = 0.0
             if episode < EPISODES_IMITATE and len(ep_actions) > 0 and len(ep_bs_deltas) == len(ep_actions):
-                actor_actions_tanh = torch.tensor(
-                    [a / 2.0 for a in ep_actions],
-                    dtype=torch.float32,
-                    device=device,
-                )
+                # actions and BS deltas are both in [0,1] space
+                actor_actions_01 = torch.tensor(ep_actions, dtype=torch.float32, device=device)
                 bs_deltas_t = torch.tensor(
                     ep_bs_deltas,
                     dtype=torch.float32,
                     device=device,
                 )
-                imit_loss = nn.functional.mse_loss(actor_actions_tanh, bs_deltas_t)
+                imit_loss = nn.functional.mse_loss(actor_actions_01, bs_deltas_t)
 
                 frac = max(0.0, 1.0 - (episode / EPISODES_IMITATE))
                 imit_weight = IMITATION_END_WEIGHT + (IMITATION_START_WEIGHT - IMITATION_END_WEIGHT) * frac
@@ -657,12 +697,12 @@ def train_era_rl(
     print("Exporting training logs...")
     # 1. Step-level log
     df_log = pd.DataFrame(training_log)
-    df_log.to_csv("training_log_v2(test5(5k)).csv", index=False)
+    df_log.to_csv("training_log_v2(test6(5k)).csv", index=False)
     
     # 2. Episode-level summary
     df_summary = pd.DataFrame(episode_summaries)
-    df_summary.to_csv("episode_summaries(test5(5k)).csv", index=False)
-    print("Logs saved: training_log_v2(test5(5k)).csv, episode_summaries(test5(5k)).csv")
+    df_summary.to_csv("episode_summaries(test6(5k)).csv", index=False)
+    print("Logs saved: training_log_v2(test6(5k)).csv, episode_summaries(test6(5k)).csv")
 
     # --- Quick summaries / smoke-test diagnostics ---
     try:
@@ -687,39 +727,153 @@ def train_era_rl(
     except Exception as e:
         print("Summary printing failed:", repr(e))
 
-    # --- DASHBOARD ---
+# --- DASHBOARD & MASTERY REPORT ---
     print("Generating final dashboard...")
     agent.eval()
+
+    # ============================================================
+    # 1) Rollout one episode for behavior visualization
+    # ============================================================
     obs, _ = env.reset()
-    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
+    
+    # Recalculate A_t setup for rollout
+    notional = max(1.0, cfg['option'].get('notional', cfg['option'].get('K', 1.0)))
+    running_sum = float(env.S_t)
+    running_count = 1
+    A_t = running_sum / running_count
+
+    obs_with_A = np.concatenate([
+        np.asarray(obs, dtype=np.float32),
+        np.asarray([A_t / notional], dtype=np.float32)
+    ])
+
+    obs_tensor = torch.tensor(obs_with_A, dtype=torch.float32, device=device)
     obs_history = deque([obs_tensor for _ in range(seq_len)], maxlen=seq_len)
     prev_hedge = torch.tensor([[0.0]], device=device)
-    
+
     hist = {'prices': [], 'deltas': [], 'actions': [], 'modes': [], 'xis': []}
-    
+
     done = False
     while not done:
         obs_seq = torch.stack(list(obs_history)).unsqueeze(0)
-        
         diag = agent.get_diagnostics(obs_seq, prev_hedge)
-        
+
+        # BS Delta for comparison
         tau = env.T - env.t_idx * env.dt
-        _, delta, _, _ = bs_greeks(env.S_t, cfg['option']['K'], 0, 0, env.V_t, tau, 'call')
-        
+        _, delta, _, _ = bs_greeks(
+            env.S_t, cfg['option']['K'], 0, 0, env.V_t, tau, 'call'
+        )
+
         hist['prices'].append(env.S_t)
         hist['deltas'].append(delta)
-        hist['actions'].append(float(np.clip(diag['sampled_action'] * 2.0, -2.0, 2.0)))
+        # MixtureSigmoidNormal actions are already in [0,1]
+        hist['actions'].append(float(np.clip(diag['sampled_action'], 0.0, 1.0)))
         hist['modes'].append(diag['mode'])
         hist['xis'].append(diag['xi'])
 
-        action_eval = float(np.clip(diag['action_mean'] * 2.0, -2.0, 2.0))
+        action_eval = float(np.clip(diag['action_mean'], 0.0, 1.0))
         next_obs, _, term, trunc, _ = env.step(np.array([action_eval]))
-        obs_history.append(torch.tensor(next_obs, dtype=torch.float32, device=device))
+
+        # Update running average
+        running_sum += float(env.S_t)
+        running_count += 1
+        A_t = running_sum / running_count
+
+        next_obs_with_A = np.concatenate([
+            np.asarray(next_obs, dtype=np.float32),
+            np.asarray([A_t / notional], dtype=np.float32),
+        ])
+
+        obs_history.append(torch.tensor(next_obs_with_A, dtype=torch.float32, device=device))
         prev_hedge = torch.tensor([[action_eval]], dtype=torch.float32, device=device)
         done = term or trunc
+
+    # ============================================================
+    # 2) BUILD VERTICAL MASTERY REPORT (Fixed Layout & Files)
+    # ============================================================
+    try:
+        # FIX 1: Use the EXACT filenames you saved earlier
+        log_df = pd.read_csv("training_log_v2(test6(5k)).csv")
+        sum_df = pd.read_csv("episode_summaries(test6(5k)).csv")
+
+        # Prepare Data
+        if 'EpisodeTotalPnl' in sum_df.columns:
+            ep_pnls = sum_df['EpisodeTotalPnl'].values
+        else:
+            ep_pnls = log_df.groupby('Episode')['RL_PnL'].sum().values
+
+        window = 100
+        ma = pd.Series(ep_pnls).rolling(window, min_periods=1).mean().values
         
-    save_dashboard(hist)
+        critic_cvar = sum_df['Critic_CVaR_Estimate'].values
+        empirical_cvar_series = sum_df['Empirical_RL_CVaR'].values
+        action_std = sum_df['ActionStd'].values
+
+        # Rollout Data
+        prices = np.array(hist['prices'])
+        actions = np.array(hist['actions'])
+        deltas = np.array(hist['deltas'])
+        steps = np.arange(len(prices))
+
+        # FIX 2: Vertical Stack (4 Rows, 1 Column)
+        fig, axes = plt.subplots(4, 1, figsize=(12, 18))  # Taller figure
+        
+        # --- Panel 1: PnL History ---
+        axes[0].plot(ep_pnls, alpha=0.3, label='Raw RL PnL', color='blue')
+        axes[0].plot(ma, color='red', linewidth=2, label=f'{window}-Ep Moving Avg')
+        axes[0].set_title('RL Agent Profit/Loss Convergence')
+        axes[0].set_ylabel('Total PnL')
+        axes[0].legend(loc='upper left')
+        axes[0].grid(True, alpha=0.3)
+
+        # --- Panel 2: The "Delusion Gap" ---
+        axes[1].plot(critic_cvar, color='green', label='Critic Estimate', linewidth=1.5)
+        axes[1].plot(empirical_cvar_series, color='orange', label='Empirical Reality', linewidth=1.5, alpha=0.8)
+        axes[1].set_title('Risk Perception: Critic CVaR vs. Actual CVaR')
+        axes[1].set_ylabel('CVaR (Loss Magnitude)')
+        axes[1].legend(loc='upper right')
+        axes[1].grid(True, alpha=0.3)
+
+        # --- Panel 3: Confidence (Action Std) ---
+        axes[2].plot(action_std, color='purple', label='Action Std Dev')
+        axes[2].set_title('Agent Confidence (Exploration Decay)')
+        axes[2].set_ylabel('Std Dev')
+        axes[2].legend(loc='upper right')
+        axes[2].grid(True, alpha=0.3)
+
+        # --- Panel 4: Final Episode Behavior (Dual Axis) ---
+        ax4 = axes[3]
+        ax4_twin = ax4.twinx()
+        
+        # Left Axis: Price
+        ax4.plot(steps, prices, color='black', label='Asset Price', linewidth=1.5)
+        ax4.set_ylabel('Price', color='black')
+        ax4.set_xlabel('Step (Final Episode)')
+        
+        # Right Axis: Actions vs Delta
+        ax4_twin.plot(steps, deltas, linestyle='--', color='gray', label='BS Delta', linewidth=2)
+        ax4_twin.plot(steps, actions, color='blue', label='RL Action', linewidth=2)
+        ax4_twin.set_ylabel('Hedge Ratio', color='blue')
+        ax4_twin.set_ylim(-0.1, 1.1)  # Fix limits to show [0,1] clearly
+
+        # Combined Legend
+        lines1, labels1 = ax4.get_legend_handles_labels()
+        lines2, labels2 = ax4_twin.get_legend_handles_labels()
+        ax4.legend(lines1 + lines2, labels1 + labels2, loc='upper center', ncol=3)
+        ax4.set_title('Final Policy: RL Hedge vs. Black-Scholes Delta')
+        ax4.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig("mastery_report_vertical.png", dpi=160)
+        print("Mastery report saved to: mastery_report_vertical.png")
+
+    except Exception as e:
+        print(f"Could not build mastery report: {e}")
+        import traceback
+        traceback.print_exc()
+
     print("Done.")
+
 
 if __name__ == "__main__":
     train_era_rl()

@@ -121,6 +121,81 @@ class MixtureTanhNormal:
         best_mean = self.means[torch.arange(self.means.size(0)), best_mode]
         return torch.tanh(best_mean)
 
+
+class MixtureSigmoidNormal:
+    """Mixture of Gaussians squashed by Sigmoid to produce actions in (0, 1).
+
+    Implements a proper log_prob with the sigmoid (logit) change-of-variables:
+    a = sigmoid(z), z ~ N(mu, sigma)
+    log p(a) = log sum_k pi_k N(logit(a) | mu_k, sigma_k) - sum log(a(1-a)).
+    """
+
+    def __init__(self, categorical_logits, means, stds):
+        self.cat_dist = Categorical(logits=categorical_logits)
+        self.means = means
+        self.stds = stds
+
+    def sample(self):
+        mode_indices = self.cat_dist.sample()
+        self.last_mode_indices = mode_indices
+        z = torch.normal(self.means, self.stds)
+        chosen_z = z[torch.arange(z.size(0)), mode_indices]
+        return torch.sigmoid(chosen_z)
+
+    def sample_with_mode(self):
+        mode_indices = self.cat_dist.sample()
+        self.last_mode_indices = mode_indices
+        z = torch.normal(self.means, self.stds)
+        chosen_z = z[torch.arange(z.size(0)), mode_indices]
+        return torch.sigmoid(chosen_z), mode_indices
+
+    def log_prob(self, action):
+        eps = 1e-6
+
+        if action.dim() == 0:
+            action = action.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(-1)  # [B, 1]
+
+        action_clamped = action.clamp(min=eps, max=1.0 - eps)
+        action_logit = torch.log(action_clamped) - torch.log1p(-action_clamped)  # logit
+
+        # Component log probs under Normal(logit(a))
+        action_expanded = action_logit.unsqueeze(1)  # [B, 1, D]
+
+        means = self.means
+        stds = self.stds
+        if means.dim() == 2:
+            means = means.unsqueeze(-1)  # [B, K, 1]
+        if stds.dim() == 2:
+            stds = stds.unsqueeze(-1)    # [B, K, 1]
+
+        comp_lp = Normal(means, stds).log_prob(action_expanded)  # [B, K, D]
+        comp_log_probs = comp_lp.sum(dim=-1)  # [B, K]
+
+        mixed_log_prob = torch.logsumexp(self.cat_dist.logits + comp_log_probs, dim=1) - \
+                         torch.logsumexp(self.cat_dist.logits, dim=1)
+
+        # Jacobian: dz/da = 1/(a(1-a)) => log|dz/da| = -log(a) - log(1-a)
+        jacobian = -(torch.log(action_clamped) + torch.log1p(-action_clamped)).sum(dim=-1)
+
+        return mixed_log_prob + jacobian
+
+    def entropy(self):
+        """Approximate entropy (ignores sigmoid change-of-variables correction)."""
+        cat_ent = self.cat_dist.entropy()  # [B]
+        comp_ent = Normal(self.means, self.stds).entropy()  # [B, K] or [B, K, D]
+        if comp_ent.dim() > 2:
+            comp_ent = comp_ent.sum(dim=-1)
+        weights = torch.softmax(self.cat_dist.logits, dim=-1)  # [B, K]
+        mix_ent = (weights * comp_ent).sum(dim=-1)  # [B]
+        return cat_ent + mix_ent
+
+    def mode(self):
+        best_mode = torch.argmax(self.cat_dist.logits, dim=1)
+        best_mean = self.means[torch.arange(self.means.size(0)), best_mode]
+        return torch.sigmoid(best_mean)
+
 # -------------------------------------------------------------------
 # 2. ENCODER WITH GRADIENT BLOCKING (Fix Gap 6)
 # -------------------------------------------------------------------
@@ -198,6 +273,13 @@ class HybridDistributionalCritic(nn.Module):
     def __init__(self, latent_dim, num_quantiles=32):
         super().__init__()
         self.num_quantiles = num_quantiles
+        # Quantile grid used by the quantile regression loss in training.
+        # We keep it here to consistently pick VaR thresholds from predicted quantiles.
+        self.register_buffer(
+            "taus",
+            torch.linspace(0.05, 0.95, num_quantiles).view(1, num_quantiles),
+            persistent=False,
+        )
         
         # 1. Trajectory Attention Head (The Fix)
         # Calculates relevance of each history step to the current state
@@ -247,8 +329,9 @@ class HybridDistributionalCritic(nn.Module):
         body_feat = self.body_net(context_vector)
         quantiles = self.quantile_layer(body_feat)
         
-        # 2. Consistency Threshold (First quantile)
-        u_threshold = quantiles[:, 0].unsqueeze(1).detach()
+        # 2. Tail Threshold u: use VaR at 0.95 (right-tail threshold for LOSS space)
+        # NOTE: taus are in [0.05, 0.95], so VaR_0.95 corresponds to the last quantile.
+        u_threshold = quantiles[:, -1:].detach()
         
         # 3. Tail (using current latent is usually fine, or use context)
         raw_tail = self.tail_net(latent) 
@@ -316,8 +399,8 @@ class MixtureActor(nn.Module):
         stds = F.softplus(self.stds_head(x)) + 1e-4
         
         # Return distribution object for loss calculation
-        # (Custom wrapper needed for PyTorch MixtureSameFamily with Tanh)
-        return MixtureTanhNormal(logits, means, stds)
+        # We use sigmoid-squashed mixture to enforce actions in [0, 1].
+        return MixtureSigmoidNormal(logits, means, stds)
 
 # -------------------------------------------------------------------
 # 5. ERA-RL V2 AGENT
@@ -347,7 +430,18 @@ class ERARL_Agent_V2(nn.Module):
         """
         Computes the penalty term. Can be easily swapped for other metrics.
         """
-        u = risk_out['u']
+        # For LOSS-space tail risk at level alpha (e.g. 5%), the corresponding VaR
+        # threshold is VaR_{1-alpha}. Prefer deriving it directly from quantiles.
+        u = risk_out.get('u', None)
+        quantiles = risk_out.get('quantiles', None)
+        if quantiles is not None:
+            q_level = float(1.0 - alpha)
+            # Map q_level onto the same grid used in training: taus in [0.05, 0.95]
+            taus = torch.linspace(0.05, 0.95, quantiles.size(1), device=quantiles.device)
+            idx = int(torch.argmin((taus - q_level).abs()).item())
+            u = quantiles[:, idx:idx+1]
+        if u is None:
+            raise KeyError("risk_out must contain either 'quantiles' or 'u'")
         sigma = risk_out['sigma']
         xi = risk_out['xi']
         
